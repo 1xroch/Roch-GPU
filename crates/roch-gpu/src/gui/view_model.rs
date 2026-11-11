@@ -246,17 +246,14 @@ enum StartupPlan {
     Unregister,
 }
 
-/// `bus 5` from `PCI bus 5, slot 0`; the whole address when it has another shape, `None` when there
-/// is nothing to tell apart by.
-fn short_bus(bus_id: &str) -> Option<String> {
-    let bus = bus_id.trim();
-    if bus.is_empty() || bus == "PCI" {
-        return None;
+/// How to name a card's bus in a label: `bus 5` from the number the backend read, else the backend's
+/// whole address, `None` when there is nothing to tell apart by.
+fn short_bus(d: &GpuDevice) -> Option<String> {
+    if let Some(bus) = d.pci_bus {
+        return Some(format!("bus {bus}"));
     }
-    Some(match bus.strip_prefix("PCI ").and_then(|rest| rest.split(',').next()) {
-        Some(short) => short.trim().to_string(),
-        None => bus.to_string(),
-    })
+    let bus = d.bus_id.trim();
+    (!bus.is_empty() && bus != "PCI").then(|| bus.to_string())
 }
 
 fn now_hms() -> String {
@@ -537,7 +534,7 @@ impl MainViewModel {
             parts.push(board.to_string());
         }
         if (board.is_empty() || twins.iter().any(|(_, o)| o.board_vendor.trim() == board))
-            && let Some(bus) = short_bus(&d.bus_id)
+            && let Some(bus) = short_bus(d)
         {
             parts.push(bus);
         }

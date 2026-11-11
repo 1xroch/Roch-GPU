@@ -98,6 +98,7 @@ impl OffsetStyleBackend {
             override_caps: None,
             current_curve: None,
             devices: vec![GpuDevice {
+                pci_bus: None,
                 board_vendor: String::new(),
                 index: 0,
                 name: "Test RDNA".into(),

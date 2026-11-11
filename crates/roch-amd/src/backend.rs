@@ -400,6 +400,7 @@ impl AmdBackend {
             let vram_megabytes = self.read_vram_megabytes(ai.i_adapter_index);
             let bios_version = self.read_bios_version(ai.i_adapter_index);
             self.devices.push(GpuDevice {
+                pci_bus: None,
                 board_vendor: String::new(),
                 index: self.devices.len(),
                 // A blank ADL name stays blank (the original's "AMD GPU" fallback only caught null).

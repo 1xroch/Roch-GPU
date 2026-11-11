@@ -127,19 +127,30 @@ pub(crate) const MIN_LOCKABLE_MHZ: i32 = 210;
 /// answered.
 pub(crate) const MAX_DOMAIN_TYPE: i32 = 31;
 
+/// One card's memory chip temperature state between samples.
+#[derive(Debug, Default)]
+pub(crate) struct MemoryChipState {
+    /// GDDR6X or GDDR7, the memory whose chips report through these registers. Read once.
+    supported: bool,
+    /// Which partitions answer; empty until one does, and looked for again until then.
+    layout: crate::private::MemoryLayout,
+    /// Whether a back-of-board chip has ever read differently from its front one.
+    backs_differ: bool,
+}
+
 /// The NVIDIA backend. See the module docs.
 pub struct NvidiaBackend {
     gpus: Vec<GpuHandle>,
     devices: Vec<GpuDevice>,
     caps_cache: HashMap<usize, GpuCapabilities>,
     thermal_mask: HashMap<usize, u32>,
-    /// Whether this card's hot spot is read from the Blackwell register, decided on its first sample
-    /// with a GPU temperature. See `telemetry::blackwell_hotspot`.
+    /// Whether this card's hot spot is read from the Blackwell register: true once the edge check
+    /// has passed, false for a card that is not an RTX 50, absent while still unconfirmed. See
+    /// `telemetry::blackwell_hotspot`.
     blackwell_hotspot_map: HashMap<usize, bool>,
-    /// Where each memory chip's temperature lives, found on the first sample that reads them.
-    memory_chip_slots: HashMap<usize, Vec<crate::private::MemoryChipSlot>>,
-    /// Whether a back-of-board chip has ever read differently from its front one, per card.
-    memory_chip_backs_differ: HashMap<usize, bool>,
+    /// Per card, what the memory chip temperatures need between samples. See
+    /// `telemetry::memory_chip_sensors`.
+    memory_chips: HashMap<usize, MemoryChipState>,
     /// The default power limit per GPU in watts (NaN when NVML has none), read once: the
     /// denominator of the power percentage. See `nvml::default_power_limit_watts`.
     tdp_watts: HashMap<usize, f64>,
@@ -193,8 +204,7 @@ impl NvidiaBackend {
             caps_cache: HashMap::new(),
             thermal_mask: HashMap::new(),
             blackwell_hotspot_map: HashMap::new(),
-            memory_chip_slots: HashMap::new(),
-            memory_chip_backs_differ: HashMap::new(),
+            memory_chips: HashMap::new(),
             tdp_watts: HashMap::new(),
             initialized: false,
             voltage_lock_mechanism: "none".into(),
@@ -235,8 +245,9 @@ impl NvidiaBackend {
 
         self.devices.clear();
         for (i, &g) in gpus.iter().enumerate() {
-            let bus = match (nvapi::bus_id(g), nvapi::bus_slot_id(g)) {
-                (Ok(b), Ok(s)) => format!("PCI bus {b}, slot {s}"),
+            let pci_bus = nvapi::bus_id(g).ok().and_then(|b| u32::try_from(b).ok());
+            let bus = match (pci_bus, nvapi::bus_slot_id(g)) {
+                (Some(b), Ok(s)) => format!("PCI bus {b}, slot {s}"),
                 _ => "PCI".into(),
             };
             let board_vendor = nvapi::pci_identifiers_checked(g)
@@ -245,6 +256,7 @@ impl NvidiaBackend {
                 .map(|p| GpuIdentity::board_vendor((p.sub_system_id & 0xFFFF) as i32))
                 .unwrap_or_default();
             self.devices.push(GpuDevice {
+                pci_bus,
                 board_vendor,
                 index: i,
                 name: nvapi::full_name(g).unwrap_or_else(|_| "NVIDIA GPU".into()),
@@ -323,8 +335,10 @@ impl NvidiaBackend {
         let pcie = nvml::pcie_link(nvml_index);
         let rebar = nvml::resizable_bar_enabled(nvml_index);
 
-        // The driver's base and boost clocks (types 1 and 2), MHz. NVAPI reports memory at half its
-        // transfer rate on every GDDR generation here (14001 MHz for GDDR7 at 28 Gbps).
+        // The driver's base and boost clocks (types 1 and 2), MHz. They are the stock figures, not
+        // moved by an applied offset: with +315 MHz on an RTX 5060 Ti they still read 2407 / 2572,
+        // as GPU-Z's default clock does. NVAPI reports memory at half its transfer rate on every GDDR
+        // generation here (14001 MHz for GDDR7 at 28 Gbps).
         let domain_mhz = |clock_type: u32, domain: u32| {
             nvapi::clock_frequencies(g, clock_type)
                 .map(|c| c.clocks[domain as usize].frequency_khz as f64 / 1000.0)
@@ -333,6 +347,8 @@ impl NvidiaBackend {
         let base_mhz = domain_mhz(1, caps::DOMAIN_GRAPHICS);
         let boost_mhz = domain_mhz(2, caps::DOMAIN_GRAPHICS);
         let memory_mhz = domain_mhz(1, caps::DOMAIN_MEMORY);
+        // The same once-read default limit the power percentage divides by.
+        let tdp = *self.tdp_watts.entry(gpu).or_insert_with(|| nvml::default_power_limit_watts(nvml_index));
 
         Ok(GpuGraphicsInfo {
             device_id: pci
@@ -343,7 +359,7 @@ impl NvidiaBackend {
                 .unwrap_or_default(),
             clocks: GpuIdentity::clocks_text(base_mhz, boost_mhz),
             fill_rate: GpuIdentity::fill_rate_text(rops, tmus, boost_mhz),
-            tdp: GpuIdentity::watts_text(nvml::default_power_limit_watts(nvml_index)),
+            tdp: GpuIdentity::watts_text(tdp),
             bandwidth: GpuIdentity::bandwidth_text(memory_mhz * 2.0, bus_width),
             board_manufacturer: pci
                 .map(|p| GpuIdentity::board_vendor((p.sub_system_id & 0xFFFF) as i32))

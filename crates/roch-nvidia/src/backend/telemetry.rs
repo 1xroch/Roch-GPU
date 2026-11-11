@@ -71,7 +71,7 @@ impl NvidiaBackend {
             Some(true) => {}
             Some(false) => return f64::NAN, // not an RTX 50
             None => {
-                if !self.device_name(gpu).to_lowercase().contains("rtx 50") {
+                if !private::is_geforce_rtx_50(&self.device_name(gpu)) {
                     self.blackwell_hotspot_map.insert(gpu, false);
                     return f64::NAN;
                 }
@@ -92,18 +92,29 @@ impl NvidiaBackend {
 
     /// Each memory chip's temperature, as Temperatures rows ("Memory chip A0"), on a card whose
     /// register map the hot spot already confirmed (so RTX 50 only, and never on a chip laid out
-    /// differently). Where the chips are is found once per card; after that a sample reads one
-    /// register per chip position. Back-of-board chips get rows of their own only once they read
-    /// differently from the front ([`private::chip_rows`]). Read-only.
+    /// differently) and whose memory is GDDR6X or GDDR7. Which partitions exist is found once, and
+    /// tried again on later samples while none answers; each sample then reads every partition's
+    /// status and data words in one batched call, so the live word of each pair is chosen afresh.
+    /// Back-of-board chips get rows of their own only once they read differently from the front
+    /// ([`private::chip_rows`]). Read-only.
     fn memory_chip_sensors(&mut self, gpu: usize, g: GpuHandle) -> Vec<SupplementalSensor> {
         if self.blackwell_hotspot_map.get(&gpu) != Some(&true) {
             return Vec::new();
         }
-        let read = |r: u32| private::read_register(g, r).ok();
-        let slots = self.memory_chip_slots.entry(gpu).or_insert_with(|| private::find_memory_chips(read));
-        let chips = private::read_memory_chips(slots, read);
-        let backs_differ = self.memory_chip_backs_differ.entry(gpu).or_default();
-        private::chip_rows(&chips, backs_differ)
+        let state = self.memory_chips.entry(gpu).or_insert_with(|| super::MemoryChipState {
+            supported: nvapi::ram_type(g).is_ok_and(private::memory_reports_chip_temperatures),
+            ..Default::default()
+        });
+        if !state.supported {
+            return Vec::new();
+        }
+        if state.layout.partitions.is_empty() {
+            let registers = private::memory_layout_registers();
+            state.layout = private::memory_layout(private::register_snapshot(g, &registers));
+        }
+        let read = private::register_snapshot(g, &private::memory_chip_registers(&state.layout));
+        let chips = private::read_memory_chips(&state.layout, read);
+        private::chip_rows(&chips, &mut state.backs_differ)
             .into_iter()
             .map(|(id, name, celsius)| SupplementalSensor::new(format!("nv:memchip-{id}"), name, "°C", celsius))
             .collect()

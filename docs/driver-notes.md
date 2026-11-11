@@ -52,15 +52,18 @@ clock movement is not used as proof that an offset was applied.
   smoothed public reading (74 against 69 °C), so the check allows 8 °C, requires the register to be a bare
   byte, and is retried each sample until it passes. `RochGPU.exe
   diag` prints the whole bank.
-- **Memory chip temperatures come from the same register path.** Per LACT (MIT,
-  ilya-zlobintsev/LACT#1125): partition status words at `0x9024D0 + n × 0x4000` flag live data words
-  at `0x9024C0+`, each holding the front chip in bits 16–23 and, on a clamshell board (bit 22 of
-  `0x900200`), the back chip in bits 24–31, as `2 × min(raw, 80) − 40` °C. Both 16 GB RTX 5060 Ti
-  here are clamshell with eight chips (A0–B1, front and back). The hottest chip equalled the private
-  thermal call's memory-junction reading on both cards, and HWiNFO's chip maximum on both
-  (48 °C under a 168 W load). At idle and under load every back reading equalled its front one, so
-  the back byte most likely copies it on GB206: Telemetry shows one row per chip and adds back rows
-  only once a card's backs read differently. Shown only on cards whose hot-spot map was confirmed.
+- **Memory chip temperatures come from the same register path.** Registers and decoding per LACT
+  (MIT, ilya-zlobintsev/LACT#1125): partition status words at `0x9024D0 + n × 0x4000` flag which
+  of four data words at `0x9024C0+` are live (bits 24–27), each word carrying a temperature byte in
+  bits 16–23 (and another in 24–31 on a clamshell board, bit 22 of `0x900200`), as
+  `2 × min(raw, 80) − 40` °C. LACT pairs the words (+0x8 and +0xC as alternates of +0x0 and +0x4);
+  on both 16 GB RTX 5060 Ti here every status word read `0xFF000000`, all four words live at once
+  with different values, and the memory junction equalled the maximum over all four (40 °C on the
+  MSI card, where LACT's pick gave 38). So each live word is read as a chip of its own: two
+  partitions of four, the eight chips the board carries (A0–A3, B0–B3). Each word repeats one
+  byte four times, so the second byte adds nothing there; Telemetry shows it as a "(back)" row only
+  once it reads differently. Read only on GDDR6X/GDDR7 cards whose hot-spot map was confirmed, with
+  the status re-read each sample, all in one batched call.
 - **The thermal call carries no hot spot or memory chip temperature on Blackwell.** Not a gap in the
   reading: the thermal call has three versions, and the driver names them itself when handed a wrong one
   (`Ver-1:1003c Ver-2:200a8 Ver-3:334c8`, packing as version|size). v2 is the 0xA8 struct already in

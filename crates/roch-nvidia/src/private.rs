@@ -207,7 +207,7 @@ pub fn interpret(gpu_name: &str, slots: &[f64]) -> (f64, f64) {
     // a nineteen-bit one). Slot 1 tracks the public GPU reading within half a degree; slot 2 sits
     // about eight above it, which is where memory junction sits. The hot spot is read from its
     // register instead ([`BLACKWELL_HOTSPOT_REGISTER`]).
-    if name.contains("rtx 50") {
+    if is_geforce_rtx_50(&name) {
         return (f64::NAN, pick(2));
     }
     if name.contains("rtx 40") {
@@ -350,37 +350,65 @@ pub fn blackwell_hotspot(raw: u32, gpu_temperature_c: f64) -> Option<f64> {
     (c > 0.0 && c < 150.0 && c + 10.0 >= gpu_temperature_c).then_some(c)
 }
 
-/// A one-op read request for `offset`.
-pub fn stage_register_read(b: &mut [u8], offset: u32) {
-    wr_i32(b, 0, nvapi::version_word(REG_OPS_SIZE, 1) as i32);
-    wr_i32(b, 4, 1);
-    let op = REG_OPS_HEADER;
-    // flags in the low half, status (driver-written) in the high half.
-    wr_i32(b, op, (REG_OP_READ | REG_OP_32BIT | REG_OP_GLOBAL) as i32);
-    wr_i32(b, op + 4, offset as i32);
-    // write_mask (op + 8..16) and value (op + 16..24) stay zero.
+/// Whether this driver exports the register-op call at all.
+pub fn register_reads_available() -> bool {
+    exposes(FN_REGISTER_OP)
 }
 
-/// `(op status, value)` of the first op.
-pub fn parse_register_read(b: &[u8]) -> (u32, u32) {
-    let op = REG_OPS_HEADER;
+/// A read request for `offsets` (at most [`REG_OP_SLOTS`]): one op each, every one a 32-bit read.
+pub fn stage_register_reads(b: &mut [u8], offsets: &[u32]) {
+    debug_assert!(offsets.len() <= REG_OP_SLOTS);
+    wr_i32(b, 0, nvapi::version_word(REG_OPS_SIZE, 1) as i32);
+    wr_i32(b, 4, offsets.len() as i32);
+    for (i, &offset) in offsets.iter().enumerate() {
+        let op = REG_OPS_HEADER + i * REG_OP_BYTES;
+        // flags in the low half, status (driver-written) in the high half.
+        wr_i32(b, op, (REG_OP_READ | REG_OP_32BIT | REG_OP_GLOBAL) as i32);
+        wr_i32(b, op + 4, offset as i32);
+        // write_mask (op + 8..16) and value (op + 16..24) stay zero.
+    }
+}
+
+/// `(op status, value)` of op `i`.
+pub fn parse_register_read(b: &[u8], i: usize) -> (u32, u32) {
+    let op = REG_OPS_HEADER + i * REG_OP_BYTES;
     (rd_u32(b, op) >> 16, rd_u32(b, op + 16))
 }
 
-/// Read one 32-bit GPU register. `Err` carries the call's status (-1: not exported), or the op's
-/// own status as `1000 + status` when the call succeeded but the op did not.
-pub fn read_register(h: GpuHandle, offset: u32) -> Result<u32, i32> {
+/// Read 32-bit GPU registers, as few driver calls as the batch size allows (one for up to 256).
+/// `Err` carries the call's status (-1: not exported); an op the driver refused reads `None`.
+pub fn read_registers(h: GpuHandle, offsets: &[u32]) -> Result<Vec<Option<u32>>, i32> {
     let f = raw(FN_REGISTER_OP).ok_or(-1)?;
-    let mut b = Buf::new(REG_OPS_SIZE, CALL_SLACK);
-    stage_register_read(b.bytes_mut(), offset);
-    let status = invoke(f, h, &mut b);
-    if status != 0 {
-        return Err(status);
+    let mut values = Vec::with_capacity(offsets.len());
+    for chunk in offsets.chunks(REG_OP_SLOTS) {
+        let mut b = Buf::new(REG_OPS_SIZE, CALL_SLACK);
+        stage_register_reads(b.bytes_mut(), chunk);
+        let status = invoke(f, h, &mut b);
+        if status != 0 {
+            return Err(status);
+        }
+        values.extend((0..chunk.len()).map(|i| match parse_register_read(b.bytes(), i) {
+            (0, value) => Some(value),
+            _ => None,
+        }));
     }
-    match parse_register_read(b.bytes()) {
-        (0, value) => Ok(value),
-        (op_status, _) => Err(1000 + op_status as i32),
-    }
+    Ok(values)
+}
+
+/// Read one 32-bit GPU register. `Err` carries the call's status (-1: not exported), or 1000 when
+/// the call succeeded but the driver refused the read.
+pub fn read_register(h: GpuHandle, offset: u32) -> Result<u32, i32> {
+    read_registers(h, &[offset])?.first().copied().flatten().ok_or(1000)
+}
+
+/// `read_registers` as a lookup: every offset in `offsets` read in one call, then answered from
+/// that snapshot, for the decoders below that take a `read` function.
+pub fn register_snapshot(h: GpuHandle, offsets: &[u32]) -> impl Fn(u32) -> Option<u32> + use<> {
+    let values: BTreeMap<u32, u32> = match read_registers(h, offsets) {
+        Ok(v) => offsets.iter().zip(v).filter_map(|(&o, v)| v.map(|v| (o, v))).collect(),
+        Err(_) => BTreeMap::new(),
+    };
+    move |offset| values.get(&offset).copied()
 }
 
 /// LACT's decoding: Q8.8 in the low 16 bits.
@@ -390,20 +418,27 @@ pub fn decode_q8_8(raw: u32) -> f64 {
 
 // ------------------------------------------------------------------ GDDR6X / GDDR7 chip temperatures
 //
-// Per memory chip, through the same read-only register call. Layout and decoding are LACT's (MIT,
+// Per memory chip, through the same read-only register call. Registers and decoding are LACT's (MIT,
 // ilya-zlobintsev/LACT#1125): nine frame-buffer partitions 0x4000 apart, each with a status word
-// whose bits 24-27 flag which of four data words is live. The four form two chip positions (data
-// +0x0 or +0x8, and +0x4 or +0xC, the first live one of each pair). A live word carries the chip on
-// the front of the board in bits 16-23 and, on a clamshell board, the one behind it on the back in
-// bits 24-31. Clamshell is bit 22 of 0x900200. A partition the card does not have reads 0xBADF....
+// whose bits 24-27 flag which of four data words (+0x0, +0x4, +0x8, +0xC) is live. A live word
+// carries a temperature byte in bits 16-23 and, on a clamshell board (bit 22 of 0x900200), another
+// in bits 24-31. A partition the card does not have reads 0xBADF....
+//
+// Each live word is read as a chip of its own. LACT instead takes +0x8 and +0xC as alternates of
+// +0x0 and +0x4 and reads the first live one of each pair, but on two RTX 5060 Ti (GB206, 16 GB,
+// clamshell) the status word read 0xFF000000, all four words live at once, with different values:
+// one card's words read 38, 34, 40 and 40 °C. Its memory junction read 40 °C, the maximum over all
+// four words and not over LACT's pick (38), so the words at +0x8/+0xC are chips of their own; two
+// partitions of four make the eight chips the board carries. Every word there repeats one byte four
+// times, so the second byte matches the first; [`chip_rows`] shows it only where it does not.
 
 pub const GDDR_CLAMSHELL_REGISTER: u32 = 0x0090_0200;
 const GDDR_TEMP_DATA_BASE: u32 = 0x0090_24C0;
 const GDDR_TEMP_STATUS_BASE: u32 = 0x0090_24D0;
 const GDDR_PARTITION_STRIDE: u32 = 0x4000;
 const GDDR_PARTITIONS: u32 = 9;
-/// `(data offset, status bit)`: the two candidates for each of a partition's two chip positions.
-const GDDR_SLOT_PAIRS: [[(u32, u32); 2]; 2] = [[(0x0, 24), (0x8, 26)], [(0x4, 25), (0xC, 27)]];
+/// `(data offset, status bit)` of a partition's four data words; the index is the chip's number.
+const GDDR_DATA_WORDS: [(u32, u32); 4] = [(0x0, 24), (0x4, 25), (0x8, 26), (0xC, 27)];
 
 /// One memory chip's temperature.
 #[derive(Debug, Clone, PartialEq)]
@@ -415,13 +450,46 @@ pub struct MemoryChip {
     pub celsius: f64,
 }
 
-/// The register address of the data word holding a chip, for a cached layout to re-read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryChipSlot {
-    pub partition: u32,
-    pub position: u32,
-    pub data_register: u32,
+/// Which partitions a card has and whether its board is clamshell: what stays the same between
+/// reads. Which data word of a pair is live is not cached; every read checks the status word again.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryLayout {
     pub clamshell: bool,
+    pub partitions: Vec<u32>,
+}
+
+/// Every register [`memory_layout`] reads: the clamshell word and each partition's status.
+pub fn memory_layout_registers() -> Vec<u32> {
+    std::iter::once(GDDR_CLAMSHELL_REGISTER)
+        .chain((0..GDDR_PARTITIONS).map(|p| GDDR_TEMP_STATUS_BASE + p * GDDR_PARTITION_STRIDE))
+        .collect()
+}
+
+/// The partitions that flag at least one live data word. Empty when the card has none to read
+/// (or the reads failed); the caller tries again later rather than keeping an empty layout.
+pub fn memory_layout(read: impl Fn(u32) -> Option<u32>) -> MemoryLayout {
+    let clamshell = read(GDDR_CLAMSHELL_REGISTER).is_some_and(|v| !poisoned(v) && (v >> 22) & 1 == 1);
+    let partitions = (0..GDDR_PARTITIONS)
+        .filter(|p| {
+            read(GDDR_TEMP_STATUS_BASE + p * GDDR_PARTITION_STRIDE)
+                .is_some_and(|s| !poisoned(s) && (s >> 24) & 0xF != 0)
+        })
+        .collect();
+    MemoryLayout { clamshell, partitions }
+}
+
+/// Every register one [`read_memory_chips`] reads for `layout`: each partition's status and its four
+/// data words, so one batched call covers a whole sample.
+pub fn memory_chip_registers(layout: &MemoryLayout) -> Vec<u32> {
+    layout
+        .partitions
+        .iter()
+        .flat_map(|p| {
+            let base = p * GDDR_PARTITION_STRIDE;
+            std::iter::once(GDDR_TEMP_STATUS_BASE + base)
+                .chain([0x0, 0x4, 0x8, 0xC].map(|o| GDDR_TEMP_DATA_BASE + base + o))
+        })
+        .collect()
 }
 
 /// Raw byte to °C: `2 x min(raw, 80) - 40`, so 0..120 °C in 2 °C steps.
@@ -431,35 +499,6 @@ pub fn decode_gddr_temp(raw: u32) -> f64 {
 
 fn poisoned(word: u32) -> bool {
     word & 0xFFFF_0000 == 0xBADF_0000
-}
-
-/// Find where this card keeps its chip temperatures: the live data word of each chip position.
-/// `read` reads one register (`None` when the read fails).
-pub fn find_memory_chips(mut read: impl FnMut(u32) -> Option<u32>) -> Vec<MemoryChipSlot> {
-    let clamshell = read(GDDR_CLAMSHELL_REGISTER).is_some_and(|v| !poisoned(v) && (v >> 22) & 1 == 1);
-    let mut slots = Vec::new();
-    for partition in 0..GDDR_PARTITIONS {
-        let base = partition * GDDR_PARTITION_STRIDE;
-        let Some(status) = read(GDDR_TEMP_STATUS_BASE + base) else { continue };
-        if poisoned(status) {
-            continue;
-        }
-        let mut position = 0;
-        for pair in GDDR_SLOT_PAIRS {
-            for (offset, bit) in pair {
-                if (status >> bit) & 1 == 0 {
-                    continue;
-                }
-                let data_register = GDDR_TEMP_DATA_BASE + base + offset;
-                if read(data_register).is_some_and(|d| front_byte(d).is_some()) {
-                    slots.push(MemoryChipSlot { partition, position, data_register, clamshell });
-                    position += 1;
-                    break;
-                }
-            }
-        }
-    }
-    slots
 }
 
 /// The front chip's byte, `None` for a word that carries no reading.
@@ -474,11 +513,11 @@ fn front_byte(data: u32) -> Option<u32> {
 /// One row of the chip temperatures as shown: `(key suffix, name, °C)`.
 pub type ChipRow = (String, String, f64);
 
-/// The rows to show for `chips`: one per chip position, carrying the front reading, plus the back
-/// chips once any back has read differently from its front. On both RTX 5060 Ti here every back
-/// byte equalled its front one at idle and under load, so it most likely copies it there, and
-/// showing it would double the rows for nothing; LACT reports the two sides differing on an RTX
-/// 5090. `backs_differ` is the card's sticky record of that, so rows never come and go.
+/// The rows to show for `chips`: one per data word, carrying its first byte, plus a "(back)" row for
+/// the second byte once any second byte has read differently from its first. On both RTX 5060 Ti
+/// here the two always matched (each word repeats one byte), so showing it would double the rows for
+/// nothing; LACT reports the two differing on another card. `backs_differ` is the card's sticky
+/// record of that, so rows never come and go.
 pub fn chip_rows(chips: &[MemoryChip], backs_differ: &mut bool) -> Vec<ChipRow> {
     let front_of = |label: &str| chips.iter().find(|c| c.label == label && c.back != Some(true)).map(|c| c.celsius);
     if chips.iter().any(|c| c.back == Some(true) && front_of(&c.label).is_some_and(|f| f != c.celsius)) {
@@ -498,24 +537,46 @@ pub fn chip_rows(chips: &[MemoryChip], backs_differ: &mut bool) -> Vec<ChipRow> 
         .collect()
 }
 
-/// Read every chip at the slots [`find_memory_chips`] found.
-pub fn read_memory_chips(slots: &[MemoryChipSlot], mut read: impl FnMut(u32) -> Option<u32>) -> Vec<MemoryChip> {
+/// Read every chip of `layout`: per partition, the status word (read again each time) says which of
+/// the four data words is live, and each live one with a reading is a chip, labelled by partition
+/// letter and word number so a label always names the same chip.
+pub fn read_memory_chips(layout: &MemoryLayout, read: impl Fn(u32) -> Option<u32>) -> Vec<MemoryChip> {
     let mut chips = Vec::new();
-    for s in slots {
-        let Some(data) = read(s.data_register) else { continue };
-        let Some(front) = front_byte(data) else { continue };
-        let label = format!("{}{}", char::from(b'A' + s.partition as u8), s.position);
-        chips.push(MemoryChip {
-            label: label.clone(),
-            back: s.clamshell.then_some(false),
-            celsius: decode_gddr_temp(front),
-        });
-        let back = (data >> 24) & 0xFF;
-        if s.clamshell && back != 0 && back != 0xFF {
-            chips.push(MemoryChip { label, back: Some(true), celsius: decode_gddr_temp(back) });
+    for &partition in &layout.partitions {
+        let base = partition * GDDR_PARTITION_STRIDE;
+        let Some(status) = read(GDDR_TEMP_STATUS_BASE + base).filter(|&s| !poisoned(s)) else { continue };
+        for (number, (offset, bit)) in GDDR_DATA_WORDS.into_iter().enumerate() {
+            if (status >> bit) & 1 == 0 {
+                continue;
+            }
+            let Some(data) = read(GDDR_TEMP_DATA_BASE + base + offset) else { continue };
+            let Some(front) = front_byte(data) else { continue };
+            let label = format!("{}{number}", char::from(b'A' + partition as u8));
+            chips.push(MemoryChip {
+                label: label.clone(),
+                back: layout.clamshell.then_some(false),
+                celsius: decode_gddr_temp(front),
+            });
+            let back = (data >> 24) & 0xFF;
+            if layout.clamshell && back != 0 && back != 0xFF {
+                chips.push(MemoryChip { label, back: Some(true), celsius: decode_gddr_temp(back) });
+            }
         }
     }
     chips
+}
+
+/// Memory whose chips report their temperatures through these registers: GDDR6X (15) and GDDR7
+/// (16), NVAPI's memory type ids. LACT reads them for those two only; on GDDR6 (an RTX 5050) the
+/// words are not chip temperatures.
+pub fn memory_reports_chip_temperatures(nvapi_memory_type: u32) -> bool {
+    matches!(nvapi_memory_type, 15 | 16)
+}
+
+/// RTX 50 by name: "GeForce RTX 50..". The GeForce matters: NVIDIA's workstation Ada cards are
+/// named "RTX 5000 Ada Generation" and "RTX 500 Ada", which a bare "rtx 50" also matches.
+pub fn is_geforce_rtx_50(gpu_name: &str) -> bool {
+    gpu_name.to_lowercase().contains("geforce rtx 50")
 }
 
 // ================================================================== V/F curve
@@ -1893,18 +1954,34 @@ mod tests {
     #[test]
     fn register_read_requests_only_read() {
         let mut b = vec![0u8; REG_OPS_SIZE];
-        stage_register_read(&mut b, 0x00AD_0AA0);
+        stage_register_reads(&mut b, &[0x00AD_0AA0, 0x0090_24D0]);
         // LACT's NvGpuRegisterOpDataV1: 8 + 256 x 24 bytes, version 1.
         assert_eq!(rd_u32(&b, 0), 0x0001_1808);
-        assert_eq!(rd_u32(&b, 4), 1, "exactly one op");
-        assert_eq!(rd_u32(&b, 8), 21, "read | 32-bit | global, and no write flag");
-        assert_eq!(rd_u32(&b, 12), 0x00AD_0AA0);
-        assert!(b[16..].iter().all(|&x| x == 0), "zero write mask, and no second op");
+        assert_eq!(rd_u32(&b, 4), 2, "one op per offset");
+        for (i, offset) in [0x00AD_0AA0, 0x0090_24D0].into_iter().enumerate() {
+            let op = 8 + i * 24;
+            assert_eq!(rd_u32(&b, op), 21, "read | 32-bit | global, and no write flag");
+            assert_eq!(rd_u32(&b, op + 4), offset);
+            assert!(b[op + 8..op + 24].iter().all(|&x| x == 0), "zero write mask and value");
+        }
+        assert!(b[8 + 2 * 24..].iter().all(|&x| x == 0), "no third op");
         // The driver's answer: op status in the high half of the flags word, value at +16.
-        wr_i32(&mut b, 24, 0x2580);
-        assert_eq!(parse_register_read(&b), (0, 0x2580));
+        wr_i32(&mut b, 8 + 24 + 16, 0x2580);
+        assert_eq!(parse_register_read(&b, 1), (0, 0x2580));
         wr_i32(&mut b, 8, (3 << 16) | 21);
-        assert_eq!(parse_register_read(&b).0, 3);
+        assert_eq!(parse_register_read(&b, 0).0, 3);
+    }
+
+    #[test]
+    fn rtx_50_by_name_leaves_out_workstation_ada() {
+        assert!(is_geforce_rtx_50("NVIDIA GeForce RTX 5060 Ti"));
+        assert!(is_geforce_rtx_50("NVIDIA GeForce RTX 5090 D"));
+        assert!(is_geforce_rtx_50("NVIDIA GeForce RTX 5070 Ti Laptop GPU"));
+        assert!(!is_geforce_rtx_50("NVIDIA RTX 5000 Ada Generation"));
+        assert!(!is_geforce_rtx_50("NVIDIA RTX 500 Ada Generation Laptop GPU"));
+        assert!(!is_geforce_rtx_50("NVIDIA GeForce RTX 4070 Ti"));
+        assert!(memory_reports_chip_temperatures(16) && memory_reports_chip_temperatures(15));
+        assert!(!memory_reports_chip_temperatures(14), "GDDR6 (an RTX 5050)");
     }
 
     #[test]
@@ -1918,40 +1995,68 @@ mod tests {
     #[test]
     fn memory_chips_from_a_clamshell_register_map() {
         use std::collections::HashMap;
-        // A clamshell board with two partitions: A has both positions (the second in its alternate
-        // slot), B has one, and every other partition reads poisoned.
         let mut regs: HashMap<u32, u32> = HashMap::new();
-        regs.insert(GDDR_CLAMSHELL_REGISTER, 1 << 22);
-        regs.insert(0x0090_24D0, (1 << 24) | (1 << 27)); // A: +0x0 and +0xC live
-        regs.insert(0x0090_24C0, (0x22 << 24) | (0x24 << 16)); // A0: front 32 C, back 28 C
-        regs.insert(0x0090_24CC, (0xFF << 24) | (0x25 << 16)); // A1: front 34 C, no back reading
-        regs.insert(0x0090_64D0, 1 << 24); // B: +0x0 live
-        regs.insert(0x0090_64C0, 0x50 << 16 | 0x60 << 24); // B0: 120 C (the clamp) front and back
+        // An RTX 5060 Ti's registers as read (MSI, idle): clamshell, two partitions with all four
+        // words live, each word one byte four times, and every other partition poisoned.
+        regs.insert(GDDR_CLAMSHELL_REGISTER, 0x1EC7_8883);
+        for (status, words) in [
+            (0x0090_24D0, [0x2727_2727, 0x2525_2525, 0x2828_2828, 0x2828_2828]),
+            (0x0090_64D0, [0x2727_2727, 0x2727_2727, 0x2626_2626, 0x2828_2828]),
+        ] {
+            regs.insert(status, 0xFF00_0000);
+            for (i, w) in words.into_iter().enumerate() {
+                regs.insert(status - 0x10 + 4 * i as u32, w);
+            }
+        }
         for p in 2..9 {
             regs.insert(0x0090_24D0 + p * 0x4000, 0xBADF_5040);
         }
         let read = |r: u32| regs.get(&r).copied();
-        let slots = find_memory_chips(read);
-        assert_eq!(slots.len(), 3);
-        assert_eq!(slots[1], MemoryChipSlot { partition: 0, position: 1, data_register: 0x0090_24CC, clamshell: true });
-        let chips = read_memory_chips(&slots, read);
-        let shown: Vec<(String, Option<bool>, f64)> = chips.into_iter().map(|c| (c.label, c.back, c.celsius)).collect();
+        let layout = memory_layout(read);
+        assert_eq!(layout, MemoryLayout { clamshell: true, partitions: vec![0, 1] });
+        assert_eq!(memory_chip_registers(&layout).len(), 10, "status and four data words per partition");
+        let fronts = |chips: &[MemoryChip]| -> Vec<(String, f64)> {
+            chips.iter().filter(|c| c.back != Some(true)).map(|c| (c.label.clone(), c.celsius)).collect()
+        };
+        let chips = read_memory_chips(&layout, read);
+        let s = |l: &str, c: f64| (l.to_string(), c);
         assert_eq!(
-            shown,
+            fronts(&chips),
             [
-                ("A0".to_string(), Some(false), 32.0),
-                ("A0".to_string(), Some(true), 28.0),
-                ("A1".to_string(), Some(false), 34.0),
-                ("B0".to_string(), Some(false), 120.0),
-                ("B0".to_string(), Some(true), 120.0),
-            ]
+                s("A0", 38.0),
+                s("A1", 34.0),
+                s("A2", 40.0),
+                s("A3", 40.0),
+                s("B0", 38.0),
+                s("B1", 38.0),
+                s("B2", 36.0),
+                s("B3", 40.0)
+            ],
+            "eight chips, every live word one"
         );
-        // A one-sided board labels no side and ignores the back byte.
+        // The hottest is the card's memory junction (40 C), which LACT's pick of +0x0/+0x4 missed.
+        assert_eq!(chips.iter().map(|c| c.celsius).fold(0.0, f64::max), 40.0);
+        let mut differ = false;
+        assert_eq!(chip_rows(&chips, &mut differ).len(), 8, "repeated bytes give no back rows");
+        assert!(!differ);
+
+        // The status word drops a word and raises another: the next read follows it.
+        regs.insert(0x0090_24D0, (1 << 24) | (1 << 25));
+        let read = |r: u32| regs.get(&r).copied();
+        let labels: Vec<String> = fronts(&read_memory_chips(&layout, read)).into_iter().map(|c| c.0).collect();
+        assert_eq!(labels, ["A0", "A1", "B0", "B1", "B2", "B3"], "labels name the same chips");
+
+        // A second byte that differs is reported as the back; a one-sided board has no sides.
+        regs.insert(0x0090_24C0, (0x22 << 24) | (0x24 << 16));
+        let read = |r: u32| regs.get(&r).copied();
+        let chips = read_memory_chips(&layout, read);
+        assert!(chips.contains(&MemoryChip { label: "A0".into(), back: Some(true), celsius: 28.0 }));
         regs.insert(GDDR_CLAMSHELL_REGISTER, 0);
         let read = |r: u32| regs.get(&r).copied();
-        let chips = read_memory_chips(&find_memory_chips(read), read);
-        assert_eq!(chips.len(), 3);
-        assert!(chips.iter().all(|c| c.back.is_none()));
+        assert!(read_memory_chips(&memory_layout(read), read).iter().all(|c| c.back.is_none()));
+
+        // Nothing readable: an empty layout, for the caller to try again later.
+        assert_eq!(memory_layout(|_| None).partitions, Vec::<u32>::new());
     }
 
     #[test]

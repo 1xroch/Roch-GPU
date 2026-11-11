@@ -83,6 +83,7 @@ impl MockBackend {
         Self {
             rng: Rng(42),
             devices: vec![GpuDevice {
+                pci_bus: Some(1),
                 board_vendor: String::new(),
                 index: 0,
                 name: "Simulated RTX 4070 SUPER".into(),
@@ -143,6 +144,7 @@ impl MockBackend {
         second.index = 1;
         second.name = "Simulated RTX 4070 SUPER (2)".into();
         second.bus_id = "PCI bus 2, slot 0".into();
+        second.pci_bus = Some(2);
         m.devices.push(second);
         m.fans.push(m.fans[0]);
         m

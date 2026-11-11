@@ -248,6 +248,7 @@ fn ocp_bounds_window() {
 #[test]
 fn graphics_info_from_device() {
     let device = GpuDevice {
+        pci_bus: None,
         board_vendor: String::new(),
         index: 0,
         name: "Test GPU".into(),
