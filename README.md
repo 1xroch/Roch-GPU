@@ -4,11 +4,13 @@
 
 A native Rust tuning and monitoring tool for NVIDIA, AMD and Intel Arc GPUs on Windows, and AMD GPUs on Linux.
 
-**[Download for Windows](https://github.com/RochStudio/Roch-GPU/releases/latest)** · **[Install on Linux](docs/linux.md#install)**
+**[Download for Windows](https://github.com/1xroch/Roch-GPU/releases/latest)** · **[Install on Linux](docs/linux.md#install)**
 
 On Windows, run `RochGPU.exe` and allow administrator access when prompted. On Linux, use the Arch package or the download in the [Linux guide](docs/linux.md#install): neither needs Rust.
 
 - GPU tuning, fan controls, live telemetry and saved profiles.
+- Hot spot and per-chip memory temperatures on RTX 50 cards, which NVIDIA's driver no longer reports.
+- Several GPUs in one PC, including two of the same model, each named by its maker.
 - Custom themes, colours, fonts and layouts through the Settings gear.
 - One executable. No .NET or HWiNFO required.
 - The same window and command line on Linux, on Wayland or X11.
@@ -17,7 +19,7 @@ On Windows, run `RochGPU.exe` and allow administrator access when prompted. On L
 
 | GPU | Windows | Linux | Tested on |
 |---|---|---|---|
-| NVIDIA RTX 50 series | Yes | No | RTX 5070 Ti |
+| NVIDIA RTX 50 series | Yes | No | RTX 5070 Ti, RTX 5060 Ti (two in one PC) |
 | NVIDIA RTX 40 series | Yes | No | RTX 4070 Ti, RTX 4070 |
 | AMD RDNA 4 (RX 9000 series) | Yes | Yes, not yet run on a real card | RX 9070 XT, on Windows |
 | AMD RDNA 3 (RX 7000 series) | Yes | Yes | RX 7900 XT, on Windows and Linux |
