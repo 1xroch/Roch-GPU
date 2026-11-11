@@ -784,6 +784,7 @@ fn probe_card(api: &Igcl, h: CtlHandle, props: &Buf, index: usize) -> R<(GpuDevi
     let _ = firmware;
 
     let mut device = GpuDevice {
+        board_vendor: String::new(),
         index,
         name,
         vendor: "Intel".into(),

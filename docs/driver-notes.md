@@ -38,8 +38,31 @@ clock movement is not used as proof that an offset was applied.
   read-only-Ada conclusion used the wrong control field and is withdrawn.
 - **MSVDD is Blackwell-only.** The rail control is present on a 5070 Ti and absent on the 40-series
   cards tested, where NVVDD works on its own.
-- **Hot spot and memory chip temperature are not exposed on Blackwell.** Not a gap in the reading:
-  the thermal call has three versions, and the driver names them itself when handed a wrong one
+- **Blackwell's hot spot is read from a register, not a thermal call.** The private register-op call
+  (`0x2EB3C140`, read-only here: one 32-bit read per request, no write flag, zero write mask) reads
+  PTHERM `0xAD0AA0`, the maximum of the four on-die sensors at `0xAD0A90`–`0xAD0A9C`, as Q8.8. The
+  call and offsets are LACT's (MIT, ilya-zlobintsev/LACT#1122), mapped from live readings anchored
+  on the public temperature in LACT#1112 and confirmed there by Afterburner's author; nothing here
+  comes from NVIDIA's binaries. On two RTX 5060 Ti (GB206, 591.86) at idle the edge register
+  `0xAD0400` matched nvidia-smi to the degree, the maximum sat within 0.6 °C of HWiNFO's hot spot on
+  both cards, the second bank (`0xAD0AD0`–`0xAD0AE4`) mirrored the first exactly, and `0xAD0718`
+  read 107.0 °C, Blackwell's documented hot-spot throttle point. Telemetry uses it only on RTX 50,
+  and only once the edge register has matched the public temperature within 3 °C, so a chip laid out
+  differently shows no hot spot rather than a wrong one. Under load the edge register runs ahead of the
+  smoothed public reading (74 against 69 °C), so the check allows 8 °C, requires the register to be a bare
+  byte, and is retried each sample until it passes. `RochGPU.exe
+  diag` prints the whole bank.
+- **Memory chip temperatures come from the same register path.** Per LACT (MIT,
+  ilya-zlobintsev/LACT#1125): partition status words at `0x9024D0 + n × 0x4000` flag live data words
+  at `0x9024C0+`, each holding the front chip in bits 16–23 and, on a clamshell board (bit 22 of
+  `0x900200`), the back chip in bits 24–31, as `2 × min(raw, 80) − 40` °C. Both 16 GB RTX 5060 Ti
+  here are clamshell with eight chips (A0–B1, front and back). The hottest chip equalled the private
+  thermal call's memory-junction reading on both cards, and HWiNFO's chip maximum on both
+  (48 °C under a 168 W load). At idle and under load every back reading equalled its front one, so
+  the back byte most likely copies it on GB206: Telemetry shows one row per chip and adds back rows
+  only once a card's backs read differently. Shown only on cards whose hot-spot map was confirmed.
+- **The thermal call carries no hot spot or memory chip temperature on Blackwell.** Not a gap in the
+  reading: the thermal call has three versions, and the driver names them itself when handed a wrong one
   (`Ver-1:1003c Ver-2:200a8 Ver-3:334c8`, packing as version|size). v2 is the 0xA8 struct already in
   use; v3 is 0x34C8 bytes and wants its mask at +0x08 rather than +0x04, laying out eight channels
   of 0x8C as a reading plus a type. Read that way, a 5070 Ti populates exactly two of the eight —

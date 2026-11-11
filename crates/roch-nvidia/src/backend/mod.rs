@@ -96,12 +96,14 @@ pub struct ClockDomain {
 
 /// Marketing chip cuts and ROP counts are not exposed consistently by the driver. The device id is
 /// read from the card; an unknown id stays unknown instead of borrowing a neighbour's specs.
-const NVIDIA_PARTS: [(u16, &str, i32); 5] = [
+const NVIDIA_PARTS: [(u16, &str, i32); 6] = [
     (0x2684, "AD102-300", 176),
     (0x2704, "AD103-300", 112),
     (0x2782, "AD104-400", 80),
     (0x2786, "AD104-250", 64),
     (0x2C05, "GB203-300", 96),
+    // RTX 5060 Ti, as GPU-Z and CPU-Z name it on two cards here (MSI and ASUS).
+    (0x2D04, "GB206-300", 48),
 ];
 
 /// How much extra core voltage 100 % boost buys. Measured at ~60 mV on a 4070 Ti (1090 mV stock
@@ -131,6 +133,13 @@ pub struct NvidiaBackend {
     devices: Vec<GpuDevice>,
     caps_cache: HashMap<usize, GpuCapabilities>,
     thermal_mask: HashMap<usize, u32>,
+    /// Whether this card's hot spot is read from the Blackwell register, decided on its first sample
+    /// with a GPU temperature. See `telemetry::blackwell_hotspot`.
+    blackwell_hotspot_map: HashMap<usize, bool>,
+    /// Where each memory chip's temperature lives, found on the first sample that reads them.
+    memory_chip_slots: HashMap<usize, Vec<crate::private::MemoryChipSlot>>,
+    /// Whether a back-of-board chip has ever read differently from its front one, per card.
+    memory_chip_backs_differ: HashMap<usize, bool>,
     /// The default power limit per GPU in watts (NaN when NVML has none), read once: the
     /// denominator of the power percentage. See `nvml::default_power_limit_watts`.
     tdp_watts: HashMap<usize, f64>,
@@ -183,6 +192,9 @@ impl NvidiaBackend {
             devices: Vec::new(),
             caps_cache: HashMap::new(),
             thermal_mask: HashMap::new(),
+            blackwell_hotspot_map: HashMap::new(),
+            memory_chip_slots: HashMap::new(),
+            memory_chip_backs_differ: HashMap::new(),
             tdp_watts: HashMap::new(),
             initialized: false,
             voltage_lock_mechanism: "none".into(),
@@ -227,7 +239,13 @@ impl NvidiaBackend {
                 (Ok(b), Ok(s)) => format!("PCI bus {b}, slot {s}"),
                 _ => "PCI".into(),
             };
+            let board_vendor = nvapi::pci_identifiers_checked(g)
+                .ok()
+                .flatten()
+                .map(|p| GpuIdentity::board_vendor((p.sub_system_id & 0xFFFF) as i32))
+                .unwrap_or_default();
             self.devices.push(GpuDevice {
+                board_vendor,
                 index: i,
                 name: nvapi::full_name(g).unwrap_or_else(|_| "NVIDIA GPU".into()),
                 vendor: "NVIDIA".into(),
@@ -255,20 +273,24 @@ impl NvidiaBackend {
     }
 
     /// NVML enumerates by PCI bus and NVAPI does not, so on a multi-GPU box the ordinals disagree.
-    /// Match on the adapter name and only fall back to the ordinal when that finds nothing.
+    /// Match on the PCI bus number: two cards of the same model share a name, and matching on that
+    /// sent the second card's clock locks and reads to the first. The adapter name is the fallback
+    /// when a bus number is missing, and the ordinal when that finds nothing either.
     fn nvml_index_for(&mut self, gpu: usize) -> i32 {
         if let Some(&cached) = self.nvml_index.get(&gpu) {
             return cached;
         }
-        let mut resolved = gpu as i32;
-        let want = self.device_name(gpu);
-        for i in 0..8 {
-            let Some(name) = nvml::device_name(i) else { break };
-            if name.trim().eq_ignore_ascii_case(want.trim()) {
-                resolved = i;
-                break;
-            }
-        }
+        let nvml_names: Vec<(i32, String)> = (0..8).map_while(|i| nvml::device_name(i).map(|n| (i, n))).collect();
+        let want_bus = self.gpu(gpu).ok().and_then(|g| nvapi::bus_id(g).ok()).and_then(|b| u32::try_from(b).ok());
+        let by_bus =
+            want_bus.and_then(|want| nvml_names.iter().map(|(i, _)| *i).find(|&i| nvml::pci_bus(i) == Some(want)));
+        let resolved = by_bus.unwrap_or_else(|| {
+            let want = self.device_name(gpu);
+            nvml_names
+                .iter()
+                .find(|(_, name)| name.trim().eq_ignore_ascii_case(want.trim()))
+                .map_or(gpu as i32, |(i, _)| *i)
+        });
         self.nvml_index.insert(gpu, resolved);
         resolved
     }
@@ -295,11 +317,34 @@ impl NvidiaBackend {
         let memory_type = nvapi::ram_type(g).unwrap_or(0);
         let memory_maker = nvapi::ram_maker(g).unwrap_or(0);
         let bus_width = nvapi::ram_bus_width(g).unwrap_or(0);
-        // The C# passes the NVAPI ordinal here, not the NVML-matched index.
-        let pcie = nvml::pcie_link(gpu as i32);
-        let rebar = nvml::resizable_bar_enabled(gpu as i32);
+        // The NVML index matched to this card: with two of the same model, the raw ordinal (which the
+        // C# passed) can name the other one.
+        let nvml_index = self.nvml_index_for(gpu);
+        let pcie = nvml::pcie_link(nvml_index);
+        let rebar = nvml::resizable_bar_enabled(nvml_index);
+
+        // The driver's base and boost clocks (types 1 and 2), MHz. NVAPI reports memory at half its
+        // transfer rate on every GDDR generation here (14001 MHz for GDDR7 at 28 Gbps).
+        let domain_mhz = |clock_type: u32, domain: u32| {
+            nvapi::clock_frequencies(g, clock_type)
+                .map(|c| c.clocks[domain as usize].frequency_khz as f64 / 1000.0)
+                .unwrap_or(0.0)
+        };
+        let base_mhz = domain_mhz(1, caps::DOMAIN_GRAPHICS);
+        let boost_mhz = domain_mhz(2, caps::DOMAIN_GRAPHICS);
+        let memory_mhz = domain_mhz(1, caps::DOMAIN_MEMORY);
 
         Ok(GpuGraphicsInfo {
+            device_id: pci
+                .map(|p| {
+                    let vendor_device = (u32::from(p.external_device_id) << 16) | (p.device_id & 0xFFFF);
+                    GpuIdentity::device_id_text(vendor_device, p.sub_system_id)
+                })
+                .unwrap_or_default(),
+            clocks: GpuIdentity::clocks_text(base_mhz, boost_mhz),
+            fill_rate: GpuIdentity::fill_rate_text(rops, tmus, boost_mhz),
+            tdp: GpuIdentity::watts_text(nvml::default_power_limit_watts(nvml_index)),
+            bandwidth: GpuIdentity::bandwidth_text(memory_mhz * 2.0, bus_width),
             board_manufacturer: pci
                 .map(|p| GpuIdentity::board_vendor((p.sub_system_id & 0xFFFF) as i32))
                 .unwrap_or_default(),
@@ -311,9 +356,12 @@ impl NvidiaBackend {
             memory_type: memory_type_label(memory_type),
             memory_vendor: memory_maker_label(memory_maker),
             bus_width: if bus_width > 0 { format!("{bus_width} bits") } else { String::new() },
+            // The maximum generation (the link drops to Gen 1 at idle) but the negotiated width: NVML's
+            // maximum width is not the link's, and says x16 for an RTX 5060 Ti (an x8 card) even in an
+            // x4 slot. The width holds at idle, so the header stays stable.
             bus_interface: GpuIdentity::pcie_bus_interface(
                 pcie.max_generation,
-                pcie.max_width,
+                if pcie.current_width > 0 { pcie.current_width } else { pcie.max_width },
                 pcie.current_generation,
                 pcie.current_width,
             ),

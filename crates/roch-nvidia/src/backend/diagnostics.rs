@@ -755,6 +755,71 @@ impl NvidiaBackend {
             }),
         );
 
+        // Read-only: one 32-bit read per register, nothing written. See `private::read_register`.
+        self.section(
+            &mut sb,
+            "Blackwell thermal registers (read-only, experimental)",
+            Box::new(move |_, sb| {
+                if !private::exposes(0x2EB3_C140) {
+                    let _ = writeln!(sb, "  (register-op call not exported by this driver)");
+                    return Ok(());
+                }
+                let _ = writeln!(sb, "  offset      raw         decoded    meaning");
+                for (offset, decode, meaning) in private::BLACKWELL_THERMAL_REGISTERS {
+                    match private::read_register(g, offset) {
+                        Ok(raw) => {
+                            let _ = writeln!(
+                                sb,
+                                "  0x{offset:08X}  0x{raw:08X}  {:>7} C  {meaning}",
+                                fixed(decode.celsius(raw), 2),
+                            );
+                        }
+                        Err(status) => {
+                            let _ = writeln!(sb, "  0x{offset:08X}  failed (status {status})  {meaning}");
+                        }
+                    }
+                }
+                Ok(())
+            }),
+        );
+
+        // Read-only, as above.
+        self.section(
+            &mut sb,
+            "Memory chip temperatures (registers, read-only, experimental)",
+            Box::new(move |_, sb| {
+                if !private::exposes(0x2EB3_C140) {
+                    let _ = writeln!(sb, "  (register-op call not exported by this driver)");
+                    return Ok(());
+                }
+                let read = |r: u32| private::read_register(g, r).ok();
+                let clamshell = read(private::GDDR_CLAMSHELL_REGISTER);
+                let _ =
+                    writeln!(sb, "  clamshell register 0x{:08X} = {clamshell:08X?}", private::GDDR_CLAMSHELL_REGISTER);
+                let slots = private::find_memory_chips(read);
+                if slots.is_empty() {
+                    let _ = writeln!(sb, "  (no chip reported a temperature)");
+                    return Ok(());
+                }
+                for chip in private::read_memory_chips(&slots, read) {
+                    let side = match chip.back {
+                        Some(true) => " (back)",
+                        Some(false) => " (front)",
+                        None => "",
+                    };
+                    let _ = writeln!(sb, "  chip {}{side}: {} °C", chip.label, fixed(chip.celsius, 0));
+                }
+                for s in &slots {
+                    let _ = writeln!(
+                        sb,
+                        "  slot partition {} position {} at 0x{:08X}",
+                        s.partition, s.position, s.data_register
+                    );
+                }
+                Ok(())
+            }),
+        );
+
         self.section(
             &mut sb,
             "Private thermal shapes (version x mask -> live slots)",

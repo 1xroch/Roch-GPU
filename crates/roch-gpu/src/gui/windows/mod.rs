@@ -138,13 +138,11 @@ impl ChildChrome {
 
     /// Call at the top of the viewport's ui callback. Returns true when the user closed it.
     pub fn frame(&mut self, ctx: &Context, dark: bool) -> bool {
-        // eframe clears a child window to fully transparent. Windows ignores that; a Wayland compositor
-        // honours it, so anything the content does not cover would show what is behind the window. Some
-        // of it always goes uncovered on Hyprland, which ignores `fit` and leaves the window its opening
-        // size when the content is shorter.
-        if cfg!(not(windows)) {
-            ctx.layer_painter(egui::LayerId::background()).rect_filled(ctx.content_rect(), 0.0, theme::pal(ctx).bg);
-        }
+        // eframe clears a child window to fully transparent. Windows shows that as black and a Wayland
+        // compositor shows what is behind the window, so paint the theme background under everything:
+        // a window held taller than its content (XOC's minimum height on a card without the MSVDD
+        // rail, or Hyprland ignoring `fit`) would otherwise show a strip below the content.
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(ctx.content_rect(), 0.0, theme::pal(ctx).bg);
         let opening = self.opening();
         if opening {
             self.frames_drawn += 1;

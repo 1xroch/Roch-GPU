@@ -205,8 +205,8 @@ pub fn interpret(gpu_name: &str, slots: &[f64]) -> (f64, f64) {
     // Blackwell exposes exactly two sensors through this call, and no hot spot among them: every
     // struct version and mask width returns the same two slots (a three-bit mask returns as much as
     // a nineteen-bit one). Slot 1 tracks the public GPU reading within half a degree; slot 2 sits
-    // about eight above it, which is where memory junction sits. A tool that shows hot spot on this
-    // card reads it somewhere else.
+    // about eight above it, which is where memory junction sits. The hot spot is read from its
+    // register instead ([`BLACKWELL_HOTSPOT_REGISTER`]).
     if name.contains("rtx 50") {
         return (f64::NAN, pick(2));
     }
@@ -255,6 +255,267 @@ pub fn read_thermal_channels(h: GpuHandle) -> Vec<ThermalChannel> {
         return Vec::new();
     }
     parse_thermal_channels(&w)
+}
+
+// ================================================================== register reads (0x2EB3C140)
+//
+// The private register-op call takes a batch of GPU register operations. It is used here for READS
+// ONLY: every request carries exactly one op, with the read flag, a 32-bit access and a zero write
+// mask, and nothing in this module builds any other kind, so there is no path from here to a
+// register write. Call id and layout are LACT's (MIT, ilya-zlobintsev/LACT#1122). The Blackwell
+// thermal offsets below were mapped from live readings, anchored on the public GPU temperature
+// (LACT#1112), and confirmed there by Afterburner's author. They are undocumented, were worked out
+// on GB202/GB203, and may differ on other Blackwell chips, which is what the diagnostics probe is
+// for.
+
+const FN_REGISTER_OP: u32 = 0x2EB3_C140;
+const REG_OP_READ: u32 = 1;
+const REG_OP_32BIT: u32 = 4;
+const REG_OP_GLOBAL: u32 = 16;
+/// `{flags u16, status u16, offset u32, write_mask u64, value u64}`.
+const REG_OP_BYTES: usize = 24;
+const REG_OP_SLOTS: usize = 256;
+/// `{version, op_count}` before the ops.
+const REG_OPS_HEADER: usize = 8;
+const REG_OPS_SIZE: usize = REG_OPS_HEADER + REG_OP_SLOTS * REG_OP_BYTES;
+
+/// How a Blackwell thermal register encodes its temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterDecode {
+    /// Whole degrees in the low byte.
+    Byte,
+    /// Q8.8 in the low 16 bits.
+    Q8_8,
+    /// 1/32 °C in the low 14 bits.
+    Limit,
+}
+
+impl RegisterDecode {
+    pub fn celsius(self, raw: u32) -> f64 {
+        match self {
+            Self::Byte => (raw & 0xFF) as f64,
+            Self::Q8_8 => decode_q8_8(raw),
+            Self::Limit => (raw & 0x3FFF) as f64 / 32.0,
+        }
+    }
+}
+
+/// Blackwell PTHERM registers worth showing, with their decoding and what each is believed to hold.
+/// On two RTX 5060 Ti (GB206, driver 591.86) at idle: edge matched nvidia-smi to the degree, bank A
+/// max sat within 0.6 °C of HWiNFO's hot spot on both cards, bank B mirrored bank A exactly, and the
+/// limit read 107.0 °C, the documented Blackwell hot-spot throttle point.
+pub const BLACKWELL_THERMAL_REGISTERS: [(u32, RegisterDecode, &str); 14] = [
+    (0x00AD_0400, RegisterDecode::Byte, "edge (should equal the GPU temperature)"),
+    (0x00AD_0A90, RegisterDecode::Q8_8, "bank A source 0"),
+    (0x00AD_0A94, RegisterDecode::Q8_8, "bank A source 1"),
+    (0x00AD_0A98, RegisterDecode::Q8_8, "bank A source 2"),
+    (0x00AD_0A9C, RegisterDecode::Q8_8, "bank A source 3"),
+    (0x00AD_0AA0, RegisterDecode::Q8_8, "bank A max (hot spot)"),
+    (0x00AD_0AA4, RegisterDecode::Q8_8, "bank A average"),
+    (0x00AD_0AD0, RegisterDecode::Q8_8, "bank B source 0"),
+    (0x00AD_0AD4, RegisterDecode::Q8_8, "bank B source 1"),
+    (0x00AD_0AD8, RegisterDecode::Q8_8, "bank B source 2"),
+    (0x00AD_0ADC, RegisterDecode::Q8_8, "bank B source 3"),
+    (0x00AD_0AE0, RegisterDecode::Q8_8, "bank B max"),
+    (0x00AD_0AE4, RegisterDecode::Q8_8, "bank B average"),
+    (0x00AD_0718, RegisterDecode::Limit, "throttle limit (a threshold, not a reading)"),
+];
+
+/// The hottest of bank A's four on-die sensors: the hot spot.
+pub const BLACKWELL_HOTSPOT_REGISTER: u32 = 0x00AD_0AA0;
+/// The edge reading, which equals the public GPU temperature when the map is right.
+pub const BLACKWELL_EDGE_REGISTER: u32 = 0x00AD_0400;
+
+/// Does the edge register confirm this card has the register map the hot spot is read from? A chip
+/// laid out differently would put something else there, and its "hot spot" would be a wrong number
+/// that looks right, so the map has to earn its use against the public reading first.
+///
+/// The edge register is a bare byte (0x1F, 0x4A: nothing above bit 7 on two RTX 5060 Ti), which
+/// rules out most other contents, `0xBADF....` among them. It is instantaneous while the public
+/// reading is smoothed: under a full load on an RTX 5060 Ti it read 74 °C against the public 69.
+/// So the two need only agree within 8 °C, and a check that fails is tried again on a later sample
+/// rather than remembered (the caller's job).
+pub fn blackwell_map_confirmed(edge_raw: u32, gpu_temperature_c: f64) -> bool {
+    edge_raw >> 8 == 0
+        && edge_raw != 0
+        && gpu_temperature_c > 0.0
+        && (RegisterDecode::Byte.celsius(edge_raw) - gpu_temperature_c).abs() <= 8.0
+}
+
+/// The hot spot from its register, `None` for a reading no die gives: out of range, or well below
+/// the public temperature (a maximum of on-die sensors cannot sit under the edge; the 10 °C allows
+/// for the public reading's lag while the card cools).
+pub fn blackwell_hotspot(raw: u32, gpu_temperature_c: f64) -> Option<f64> {
+    let c = RegisterDecode::Q8_8.celsius(raw);
+    (c > 0.0 && c < 150.0 && c + 10.0 >= gpu_temperature_c).then_some(c)
+}
+
+/// A one-op read request for `offset`.
+pub fn stage_register_read(b: &mut [u8], offset: u32) {
+    wr_i32(b, 0, nvapi::version_word(REG_OPS_SIZE, 1) as i32);
+    wr_i32(b, 4, 1);
+    let op = REG_OPS_HEADER;
+    // flags in the low half, status (driver-written) in the high half.
+    wr_i32(b, op, (REG_OP_READ | REG_OP_32BIT | REG_OP_GLOBAL) as i32);
+    wr_i32(b, op + 4, offset as i32);
+    // write_mask (op + 8..16) and value (op + 16..24) stay zero.
+}
+
+/// `(op status, value)` of the first op.
+pub fn parse_register_read(b: &[u8]) -> (u32, u32) {
+    let op = REG_OPS_HEADER;
+    (rd_u32(b, op) >> 16, rd_u32(b, op + 16))
+}
+
+/// Read one 32-bit GPU register. `Err` carries the call's status (-1: not exported), or the op's
+/// own status as `1000 + status` when the call succeeded but the op did not.
+pub fn read_register(h: GpuHandle, offset: u32) -> Result<u32, i32> {
+    let f = raw(FN_REGISTER_OP).ok_or(-1)?;
+    let mut b = Buf::new(REG_OPS_SIZE, CALL_SLACK);
+    stage_register_read(b.bytes_mut(), offset);
+    let status = invoke(f, h, &mut b);
+    if status != 0 {
+        return Err(status);
+    }
+    match parse_register_read(b.bytes()) {
+        (0, value) => Ok(value),
+        (op_status, _) => Err(1000 + op_status as i32),
+    }
+}
+
+/// LACT's decoding: Q8.8 in the low 16 bits.
+pub fn decode_q8_8(raw: u32) -> f64 {
+    (raw & 0xFFFF) as f64 / 256.0
+}
+
+// ------------------------------------------------------------------ GDDR6X / GDDR7 chip temperatures
+//
+// Per memory chip, through the same read-only register call. Layout and decoding are LACT's (MIT,
+// ilya-zlobintsev/LACT#1125): nine frame-buffer partitions 0x4000 apart, each with a status word
+// whose bits 24-27 flag which of four data words is live. The four form two chip positions (data
+// +0x0 or +0x8, and +0x4 or +0xC, the first live one of each pair). A live word carries the chip on
+// the front of the board in bits 16-23 and, on a clamshell board, the one behind it on the back in
+// bits 24-31. Clamshell is bit 22 of 0x900200. A partition the card does not have reads 0xBADF....
+
+pub const GDDR_CLAMSHELL_REGISTER: u32 = 0x0090_0200;
+const GDDR_TEMP_DATA_BASE: u32 = 0x0090_24C0;
+const GDDR_TEMP_STATUS_BASE: u32 = 0x0090_24D0;
+const GDDR_PARTITION_STRIDE: u32 = 0x4000;
+const GDDR_PARTITIONS: u32 = 9;
+/// `(data offset, status bit)`: the two candidates for each of a partition's two chip positions.
+const GDDR_SLOT_PAIRS: [[(u32, u32); 2]; 2] = [[(0x0, 24), (0x8, 26)], [(0x4, 25), (0xC, 27)]];
+
+/// One memory chip's temperature.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryChip {
+    /// Partition letter and position, as LACT and HWiNFO-style tools label them: `A0`, `B1`.
+    pub label: String,
+    /// `Some(false)` front, `Some(true)` back (clamshell boards only), `None` on a one-sided board.
+    pub back: Option<bool>,
+    pub celsius: f64,
+}
+
+/// The register address of the data word holding a chip, for a cached layout to re-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryChipSlot {
+    pub partition: u32,
+    pub position: u32,
+    pub data_register: u32,
+    pub clamshell: bool,
+}
+
+/// Raw byte to °C: `2 x min(raw, 80) - 40`, so 0..120 °C in 2 °C steps.
+pub fn decode_gddr_temp(raw: u32) -> f64 {
+    (2 * raw.min(0x50)) as f64 - 40.0
+}
+
+fn poisoned(word: u32) -> bool {
+    word & 0xFFFF_0000 == 0xBADF_0000
+}
+
+/// Find where this card keeps its chip temperatures: the live data word of each chip position.
+/// `read` reads one register (`None` when the read fails).
+pub fn find_memory_chips(mut read: impl FnMut(u32) -> Option<u32>) -> Vec<MemoryChipSlot> {
+    let clamshell = read(GDDR_CLAMSHELL_REGISTER).is_some_and(|v| !poisoned(v) && (v >> 22) & 1 == 1);
+    let mut slots = Vec::new();
+    for partition in 0..GDDR_PARTITIONS {
+        let base = partition * GDDR_PARTITION_STRIDE;
+        let Some(status) = read(GDDR_TEMP_STATUS_BASE + base) else { continue };
+        if poisoned(status) {
+            continue;
+        }
+        let mut position = 0;
+        for pair in GDDR_SLOT_PAIRS {
+            for (offset, bit) in pair {
+                if (status >> bit) & 1 == 0 {
+                    continue;
+                }
+                let data_register = GDDR_TEMP_DATA_BASE + base + offset;
+                if read(data_register).is_some_and(|d| front_byte(d).is_some()) {
+                    slots.push(MemoryChipSlot { partition, position, data_register, clamshell });
+                    position += 1;
+                    break;
+                }
+            }
+        }
+    }
+    slots
+}
+
+/// The front chip's byte, `None` for a word that carries no reading.
+fn front_byte(data: u32) -> Option<u32> {
+    if data == 0 || data == u32::MAX || poisoned(data) {
+        return None;
+    }
+    let b = (data >> 16) & 0xFF;
+    (b != 0 && b != 0xFF).then_some(b)
+}
+
+/// One row of the chip temperatures as shown: `(key suffix, name, °C)`.
+pub type ChipRow = (String, String, f64);
+
+/// The rows to show for `chips`: one per chip position, carrying the front reading, plus the back
+/// chips once any back has read differently from its front. On both RTX 5060 Ti here every back
+/// byte equalled its front one at idle and under load, so it most likely copies it there, and
+/// showing it would double the rows for nothing; LACT reports the two sides differing on an RTX
+/// 5090. `backs_differ` is the card's sticky record of that, so rows never come and go.
+pub fn chip_rows(chips: &[MemoryChip], backs_differ: &mut bool) -> Vec<ChipRow> {
+    let front_of = |label: &str| chips.iter().find(|c| c.label == label && c.back != Some(true)).map(|c| c.celsius);
+    if chips.iter().any(|c| c.back == Some(true) && front_of(&c.label).is_some_and(|f| f != c.celsius)) {
+        *backs_differ = true;
+    }
+    chips
+        .iter()
+        .filter(|c| c.back != Some(true) || *backs_differ)
+        .map(|c| {
+            let id = c.label.to_lowercase();
+            if c.back == Some(true) {
+                (format!("{id}back"), format!("Memory chip {} (back)", c.label), c.celsius)
+            } else {
+                (id, format!("Memory chip {}", c.label), c.celsius)
+            }
+        })
+        .collect()
+}
+
+/// Read every chip at the slots [`find_memory_chips`] found.
+pub fn read_memory_chips(slots: &[MemoryChipSlot], mut read: impl FnMut(u32) -> Option<u32>) -> Vec<MemoryChip> {
+    let mut chips = Vec::new();
+    for s in slots {
+        let Some(data) = read(s.data_register) else { continue };
+        let Some(front) = front_byte(data) else { continue };
+        let label = format!("{}{}", char::from(b'A' + s.partition as u8), s.position);
+        chips.push(MemoryChip {
+            label: label.clone(),
+            back: s.clamshell.then_some(false),
+            celsius: decode_gddr_temp(front),
+        });
+        let back = (data >> 24) & 0xFF;
+        if s.clamshell && back != 0 && back != 0xFF {
+            chips.push(MemoryChip { label, back: Some(true), celsius: decode_gddr_temp(back) });
+        }
+    }
+    chips
 }
 
 // ================================================================== V/F curve
@@ -1628,6 +1889,130 @@ pub fn probe_xbar(h: GpuHandle) -> XbarProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_read_requests_only_read() {
+        let mut b = vec![0u8; REG_OPS_SIZE];
+        stage_register_read(&mut b, 0x00AD_0AA0);
+        // LACT's NvGpuRegisterOpDataV1: 8 + 256 x 24 bytes, version 1.
+        assert_eq!(rd_u32(&b, 0), 0x0001_1808);
+        assert_eq!(rd_u32(&b, 4), 1, "exactly one op");
+        assert_eq!(rd_u32(&b, 8), 21, "read | 32-bit | global, and no write flag");
+        assert_eq!(rd_u32(&b, 12), 0x00AD_0AA0);
+        assert!(b[16..].iter().all(|&x| x == 0), "zero write mask, and no second op");
+        // The driver's answer: op status in the high half of the flags word, value at +16.
+        wr_i32(&mut b, 24, 0x2580);
+        assert_eq!(parse_register_read(&b), (0, 0x2580));
+        wr_i32(&mut b, 8, (3 << 16) | 21);
+        assert_eq!(parse_register_read(&b).0, 3);
+    }
+
+    #[test]
+    fn register_temperature_decodings() {
+        // Raw words read from an RTX 5060 Ti (GB206).
+        assert_eq!(RegisterDecode::Q8_8.celsius(0x4000_25B8), 37.71875);
+        assert_eq!(RegisterDecode::Byte.celsius(0x0000_001E), 30.0);
+        assert_eq!(RegisterDecode::Limit.celsius(0x0348_0D60), 107.0);
+    }
+
+    #[test]
+    fn memory_chips_from_a_clamshell_register_map() {
+        use std::collections::HashMap;
+        // A clamshell board with two partitions: A has both positions (the second in its alternate
+        // slot), B has one, and every other partition reads poisoned.
+        let mut regs: HashMap<u32, u32> = HashMap::new();
+        regs.insert(GDDR_CLAMSHELL_REGISTER, 1 << 22);
+        regs.insert(0x0090_24D0, (1 << 24) | (1 << 27)); // A: +0x0 and +0xC live
+        regs.insert(0x0090_24C0, (0x22 << 24) | (0x24 << 16)); // A0: front 32 C, back 28 C
+        regs.insert(0x0090_24CC, (0xFF << 24) | (0x25 << 16)); // A1: front 34 C, no back reading
+        regs.insert(0x0090_64D0, 1 << 24); // B: +0x0 live
+        regs.insert(0x0090_64C0, 0x50 << 16 | 0x60 << 24); // B0: 120 C (the clamp) front and back
+        for p in 2..9 {
+            regs.insert(0x0090_24D0 + p * 0x4000, 0xBADF_5040);
+        }
+        let read = |r: u32| regs.get(&r).copied();
+        let slots = find_memory_chips(read);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[1], MemoryChipSlot { partition: 0, position: 1, data_register: 0x0090_24CC, clamshell: true });
+        let chips = read_memory_chips(&slots, read);
+        let shown: Vec<(String, Option<bool>, f64)> = chips.into_iter().map(|c| (c.label, c.back, c.celsius)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("A0".to_string(), Some(false), 32.0),
+                ("A0".to_string(), Some(true), 28.0),
+                ("A1".to_string(), Some(false), 34.0),
+                ("B0".to_string(), Some(false), 120.0),
+                ("B0".to_string(), Some(true), 120.0),
+            ]
+        );
+        // A one-sided board labels no side and ignores the back byte.
+        regs.insert(GDDR_CLAMSHELL_REGISTER, 0);
+        let read = |r: u32| regs.get(&r).copied();
+        let chips = read_memory_chips(&find_memory_chips(read), read);
+        assert_eq!(chips.len(), 3);
+        assert!(chips.iter().all(|c| c.back.is_none()));
+    }
+
+    #[test]
+    fn back_chips_show_only_once_they_differ_from_the_front() {
+        let chip = |label: &str, back: Option<bool>, celsius: f64| MemoryChip { label: label.into(), back, celsius };
+        let names = |rows: &[ChipRow]| rows.iter().map(|r| format!("{}={}", r.1, r.2)).collect::<Vec<_>>();
+        let mut differ = false;
+
+        // Backs equal to their fronts (an RTX 5060 Ti): one row per position.
+        let same = [
+            chip("A0", Some(false), 48.0),
+            chip("A0", Some(true), 48.0),
+            chip("B1", Some(false), 46.0),
+            chip("B1", Some(true), 46.0),
+        ];
+        assert_eq!(names(&chip_rows(&same, &mut differ)), ["Memory chip A0=48", "Memory chip B1=46"]);
+        assert!(!differ);
+        assert_eq!(chip_rows(&same, &mut differ)[0].0, "a0");
+
+        // One back reads differently: from then on every back has its own row...
+        let apart = [
+            chip("A0", Some(false), 48.0),
+            chip("A0", Some(true), 52.0),
+            chip("B1", Some(false), 46.0),
+            chip("B1", Some(true), 46.0),
+        ];
+        let rows = chip_rows(&apart, &mut differ);
+        assert!(differ);
+        assert_eq!(
+            names(&rows),
+            ["Memory chip A0=48", "Memory chip A0 (back)=52", "Memory chip B1=46", "Memory chip B1 (back)=46"]
+        );
+        assert_eq!(rows[1].0, "a0back");
+        // ...even when they agree again, so rows do not come and go.
+        assert_eq!(chip_rows(&same, &mut differ).len(), 4);
+
+        // A one-sided board: just the chips.
+        let mut differ = false;
+        let single = [chip("A0", None, 40.0), chip("A1", None, 42.0)];
+        assert_eq!(names(&chip_rows(&single, &mut differ)), ["Memory chip A0=40", "Memory chip A1=42"]);
+    }
+
+    #[test]
+    fn blackwell_hotspot_needs_a_confirmed_map_and_a_believable_reading() {
+        // Edge register 31 against a public 30 at idle, and 74 against 69 under load (RTX 5060 Ti):
+        // the map is this card's.
+        assert!(blackwell_map_confirmed(0x0000_001F, 30.0));
+        assert!(blackwell_map_confirmed(0x0000_004A, 69.0));
+        // Something else at that address (even with a plausible low byte: 0x40 is 64), a reading far
+        // off the public one, or no public reading yet: not confirmed.
+        assert!(!blackwell_map_confirmed(0xBADF_5040, 64.0));
+        assert!(!blackwell_map_confirmed(0x0000_0060, 69.0));
+        assert!(!blackwell_map_confirmed(0x0000_001F, 0.0));
+        assert!(!blackwell_map_confirmed(0, 0.5));
+        assert_eq!(blackwell_hotspot(0x4000_25B0, 30.0), Some(37.6875));
+        assert_eq!(blackwell_hotspot(0x4000_5608, 69.0), Some(86.03125));
+        // 0 and 255 C are "no reading" markers; a maximum far below the edge is not a hot spot.
+        assert_eq!(blackwell_hotspot(0, 30.0), None);
+        assert_eq!(blackwell_hotspot(0xFF00, 30.0), None);
+        assert_eq!(blackwell_hotspot(0x1000, 30.0), None);
+    }
 
     fn put(b: &mut [u8], off: usize, v: i32) {
         wr_i32(b, off, v);

@@ -87,6 +87,40 @@ fn multi_fixture() -> Fixture {
     Fixture { _dir: dir, shared, startup }
 }
 
+fn twin_fixture(boards: [&str; 2]) -> Fixture {
+    let dir = TempDir::new();
+    let store = Arc::new(ProfileStore::new(Some(dir.0.clone())).unwrap());
+    let service = Arc::new(TuningService::new(Box::new(MockBackend::with_twin_gpus(boards))));
+    service.initialize(0).unwrap();
+    let startup = Arc::new(FakeStartup::default());
+    let shared = Shared::new(service, store, AppSettings::default(), startup.clone());
+    let recovery = shared.open_recovery().unwrap();
+    shared.set_recovery(Some(recovery));
+    Fixture { _dir: dir, shared, startup }
+}
+
+#[test]
+fn two_cards_of_one_model_are_told_apart_by_maker_then_bus() {
+    // Different makers: the maker is enough.
+    let f = twin_fixture(["MSI", "ASUSTeK Computer"]);
+    let mut model = vm(&f);
+    assert_eq!(model.device_display_name(), "Simulated RTX 4070 SUPER (12GB) · MSI");
+    assert_eq!(model.gpu_choice_label(1), "2  ·  Simulated RTX 4070 SUPER  ·  ASUSTeK Computer  (PCI bus 2, slot 0)");
+    model.switch_gpu(1).unwrap();
+    assert_eq!(model.device_display_name(), "Simulated RTX 4070 SUPER (12GB) · ASUSTeK Computer");
+
+    // The same maker twice: the bus says which.
+    let f = twin_fixture(["MSI", "MSI"]);
+    assert_eq!(vm(&f).device_display_name(), "Simulated RTX 4070 SUPER (12GB) · MSI · bus 1");
+
+    // No maker known: the bus alone.
+    let f = twin_fixture(["", ""]);
+    assert_eq!(vm(&f).device_display_name(), "Simulated RTX 4070 SUPER (12GB) · bus 1");
+
+    // Different models keep their plain names.
+    assert_eq!(vm(&multi_fixture()).device_display_name(), "Simulated RTX 4070 SUPER (12GB)");
+}
+
 fn vm(f: &Fixture) -> MainViewModel {
     MainViewModel::new(f.shared.clone())
 }

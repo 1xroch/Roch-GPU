@@ -248,6 +248,7 @@ fn ocp_bounds_window() {
 #[test]
 fn graphics_info_from_device() {
     let device = GpuDevice {
+        board_vendor: String::new(),
         index: 0,
         name: "Test GPU".into(),
         vendor: "NVIDIA".into(),
@@ -263,7 +264,7 @@ fn graphics_info_from_device() {
         ..GpuGraphicsInfo::from_device(&device)
     };
     let rows = info.rows();
-    assert_eq!(rows.len(), 17, "graphics rows include firmware and PCI address");
+    assert_eq!(rows.len(), 22, "graphics rows include firmware and PCI address");
     assert_eq!(info.bios_version, "98.00");
     assert_eq!(info.bus_address, "PCI");
     assert!(rows[0].name == "GPU" && rows[0].value == "Test GPU");

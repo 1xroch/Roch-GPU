@@ -14,6 +14,7 @@ fn curve(points: &[(f64, f64)]) -> FanCurve {
 
 fn intel_device() -> GpuDevice {
     GpuDevice {
+        board_vendor: String::new(),
         index: 0,
         name: "Intel B60".into(),
         vendor: "Intel".into(),

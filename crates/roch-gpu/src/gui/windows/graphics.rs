@@ -116,7 +116,7 @@ mod tests {
             ..Default::default()
         };
         let w = GraphicsWindow::new(&info);
-        assert_eq!(w.rows().len(), 17);
+        assert_eq!(w.rows().len(), 22);
         assert!(w.rows().iter().any(|r| r.value == "ASRock"));
     }
 

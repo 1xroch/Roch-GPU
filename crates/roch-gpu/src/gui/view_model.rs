@@ -29,7 +29,7 @@ pub const SLOT_COUNT: i32 = 5;
 /// Social links in the footer, matching Roch CPU and Viewer.
 pub const FOOTER_LINKS: [(&str, &str); 3] = [
     ("YouTube", "https://www.youtube.com/@MateoPcTech"),
-    ("X", "https://x.com/MateoPCTech"),
+    ("X", "https://x.com/1xroch"),
     ("Discord", "https://discord.gg/KfzExpKQHB"),
 ];
 
@@ -244,6 +244,19 @@ enum StartupPlan {
     NoProfile,
     Register { name: String, candidate: Box<std::result::Result<TuningProfile, String>> },
     Unregister,
+}
+
+/// `bus 5` from `PCI bus 5, slot 0`; the whole address when it has another shape, `None` when there
+/// is nothing to tell apart by.
+fn short_bus(bus_id: &str) -> Option<String> {
+    let bus = bus_id.trim();
+    if bus.is_empty() || bus == "PCI" {
+        return None;
+    }
+    Some(match bus.strip_prefix("PCI ").and_then(|rest| rest.split(',').next()) {
+        Some(short) => short.trim().to_string(),
+        None => bus.to_string(),
+    })
 }
 
 fn now_hms() -> String {
@@ -495,15 +508,40 @@ impl MainViewModel {
         self.gpu_index
     }
 
-    /// A menu line that distinguishes two cards of the same model by their bus address.
+    /// A menu line that distinguishes two cards of the same model by their board maker and bus
+    /// address.
     pub fn gpu_choice_label(&self, index: usize) -> String {
         let Some(d) = self.devices.get(index) else { return String::new() };
         let number = index + 1;
+        let board = d.board_vendor.trim();
+        let name = if board.is_empty() { d.name.clone() } else { format!("{}  ·  {board}", d.name) };
         if d.bus_id.trim().is_empty() {
-            format!("{number}  ·  {}", d.name)
+            format!("{number}  ·  {name}")
         } else {
-            format!("{number}  ·  {}  ({})", d.name, d.bus_id)
+            format!("{number}  ·  {name}  ({})", d.bus_id)
         }
+    }
+
+    /// What tells card `index` apart from another of the same model: its board maker, plus its bus
+    /// when the maker is shared too (or unknown). Empty when no other card has its name, so a
+    /// single card, or two different models, keep the plain name.
+    fn twin_tag(&self, index: usize) -> String {
+        let Some(d) = self.devices.get(index) else { return String::new() };
+        let twins: Vec<_> = self.devices.iter().enumerate().filter(|&(i, o)| i != index && o.name == d.name).collect();
+        if twins.is_empty() {
+            return String::new();
+        }
+        let board = d.board_vendor.trim();
+        let mut parts = Vec::new();
+        if !board.is_empty() {
+            parts.push(board.to_string());
+        }
+        if (board.is_empty() || twins.iter().any(|(_, o)| o.board_vendor.trim() == board))
+            && let Some(bus) = short_bus(&d.bus_id)
+        {
+            parts.push(bus);
+        }
+        parts.join(" · ")
     }
 
     pub fn vram_text(&self) -> String {
@@ -515,7 +553,7 @@ impl MainViewModel {
     }
 
     pub fn device_display_name(&self) -> String {
-        if self.device.vram_megabytes > 0 {
+        let name = if self.device.vram_megabytes > 0 {
             format!(
                 "{} ({}GB)",
                 self.device.name,
@@ -523,7 +561,9 @@ impl MainViewModel {
             )
         } else {
             self.device.name.clone()
-        }
+        };
+        let tag = self.twin_tag(self.gpu_index);
+        if tag.is_empty() { name } else { format!("{name} · {tag}") }
     }
 
     pub fn telemetry_device_name(&self) -> String {
