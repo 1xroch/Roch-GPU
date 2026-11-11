@@ -18,7 +18,7 @@ This installs a release's binary as a package, so nothing is compiled and no Rus
 
 ```bash
 sudo pacman -S --needed git base-devel
-git clone --depth 1 https://github.com/RochStudio/Roch-GPU
+git clone --depth 1 https://github.com/1xroch/Roch-GPU
 cd Roch-GPU/packaging/arch
 makepkg -si
 ```
@@ -38,8 +38,8 @@ If you already installed from source, run `cargo xtask uninstall` first, because
 Download the binary from the latest release, check it, and put it on your path:
 
 ```bash
-curl -LO https://github.com/RochStudio/Roch-GPU/releases/latest/download/RochGPU-linux-x86_64
-curl -LO https://github.com/RochStudio/Roch-GPU/releases/latest/download/SHA256SUMS.txt
+curl -LO https://github.com/1xroch/Roch-GPU/releases/latest/download/RochGPU-linux-x86_64
+curl -LO https://github.com/1xroch/Roch-GPU/releases/latest/download/SHA256SUMS.txt
 sha256sum -c --ignore-missing SHA256SUMS.txt
 sudo install -m 755 RochGPU-linux-x86_64 /usr/local/bin/rochgpu
 ```

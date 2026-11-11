@@ -1,6 +1,6 @@
 # Porting notes (C# → Rust)
 
-Source of truth: `../roch-gpu-src` (RochStudio/Roch-GPU at tag v1.1.0, commit 833c8e4). Port behaviour
+Source of truth: `../roch-gpu-src` (1xroch/Roch-GPU at tag v1.1.0, commit 833c8e4). Port behaviour
 faithfully; the C# comments explain hard-won driver facts — keep the important ones (condensed) as
 Rust comments.
 

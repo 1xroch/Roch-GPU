@@ -1,0 +1,3 @@
+# GitHub's language bar: the Arch package's PKGBUILD and install hook are packaging, not the
+# program, so they are left out of the count.
+packaging/** linguist-detectable=false

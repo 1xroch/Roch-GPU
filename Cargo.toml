@@ -7,7 +7,7 @@ version = "1.1.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Roch Studio"]
-repository = "https://github.com/RochStudio/Roch-GPU"
+repository = "https://github.com/1xroch/Roch-GPU"
 
 [workspace.dependencies]
 roch-core = { path = "crates/roch-core" }

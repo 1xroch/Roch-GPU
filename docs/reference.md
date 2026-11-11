@@ -4,7 +4,7 @@
 
 # Roch GPU
 
-[![CI](https://github.com/RochStudio/Roch-GPU/actions/workflows/ci.yml/badge.svg)](https://github.com/RochStudio/Roch-GPU/actions/workflows/ci.yml)
+[![CI](https://github.com/1xroch/Roch-GPU/actions/workflows/ci.yml/badge.svg)](https://github.com/1xroch/Roch-GPU/actions/workflows/ci.yml)
 
 A GPU tuning tool for Windows that drives **both NVIDIA and AMD** cards from **one executable** —
 clocks, voltage, power and temperature limits, per-fan control and curves, live telemetry, a V/F
@@ -47,7 +47,7 @@ RPM, and no XOC or curve editor at all:
 
 ## Getting started
 
-1. **Download** `RochGPU.exe` from the [latest release](https://github.com/RochStudio/Roch-GPU/releases/latest). One file, ~67 MB.
+1. **Download** `RochGPU.exe` from the [latest release](https://github.com/1xroch/Roch-GPU/releases/latest). One file, ~67 MB.
    Put it in a folder you own, not `Program Files`.
 2. **Run it.** SmartScreen warns on first run because the binary is unsigned — **More info → Run
    anyway**. If you'd rather not, [build it yourself](#building-from-source).
@@ -146,7 +146,7 @@ Needs **Windows 10/11 x64** and the [.NET 10 SDK](https://dotnet.microsoft.com/d
 (`winget install Microsoft.DotNet.SDK.10`).
 
 ```powershell
-git clone https://github.com/RochStudio/Roch-GPU.git
+git clone https://github.com/1xroch/Roch-GPU.git
 cd Roch-GPU
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
@@ -217,7 +217,7 @@ each was established — is in **[docs/driver-notes.md](driver-notes.md)**.
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](../LICENSE), the same licence as
-[Roch Viewer](https://github.com/RochStudio/Roch-Viewer).
+[Roch Viewer](https://github.com/1xroch/Roch-Viewer).
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
 even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. It writes clocks

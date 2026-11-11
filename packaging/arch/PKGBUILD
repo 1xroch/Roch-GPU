@@ -1,4 +1,4 @@
-# Maintainer: Roch Studio <300260898+RochStudio@users.noreply.github.com>
+# Maintainer: Roch Studio <300260898+1xroch@users.noreply.github.com>
 
 # Installs the binary published with a release: nothing is compiled, so no Rust toolchain is needed.
 # It never runs `rochgpu setup`. Handing out the card's controls and changing kernel settings stay a
@@ -9,7 +9,7 @@ pkgver=1.1.2
 pkgrel=1
 pkgdesc='GPU tuning and monitoring for AMD cards: clocks, voltage, power and fans'
 arch=(x86_64)
-url='https://github.com/RochStudio/Roch-GPU'
+url='https://github.com/1xroch/Roch-GPU'
 license=(GPL-3.0-or-later)
 depends=(glibc hicolor-icon-theme libgcc)
 # The program loads the window's libraries when it opens the window, so the command line needs none of them.
@@ -30,7 +30,7 @@ conflicts=(roch-gpu)
 # Already stripped, and left alone so /usr/bin/rochgpu matches the line in the release's SHA256SUMS.txt.
 options=(!debug !strip)
 install=roch-gpu.install
-_raw="https://raw.githubusercontent.com/RochStudio/Roch-GPU/v$pkgver"
+_raw="https://raw.githubusercontent.com/1xroch/Roch-GPU/v$pkgver"
 source=("RochGPU-linux-x86_64-$pkgver::$url/releases/download/v$pkgver/RochGPU-linux-x86_64"
         "RochGPU-$pkgver.png::$_raw/crates/roch-gpu/assets/icon.png"
         "THIRD-PARTY-NOTICES-$pkgver.md::$_raw/THIRD-PARTY-NOTICES.md"

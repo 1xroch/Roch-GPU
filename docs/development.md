@@ -4,7 +4,7 @@
 
 A Windows tuning and monitoring tool for NVIDIA, AMD and Intel Arc GPUs: supported clocks, voltage, power, fans and memory timings, live telemetry, five profile slots and light/dark modes. No HWiNFO dependency.
 
-The main branch contains the Rust application. It replaces the [original C#/WPF 1.1.0 build](https://github.com/RochStudio/Roch-GPU/tree/v1.1.0) and keeps compatible profile/settings files, so an existing `%AppData%\Roch GPU` folder carries over.
+The main branch contains the Rust application. It replaces the [original C#/WPF 1.1.0 build](https://github.com/1xroch/Roch-GPU/tree/v1.1.0) and keeps compatible profile/settings files, so an existing `%AppData%\Roch GPU` folder carries over.
 
 ## What changed from the C# build
 
@@ -70,11 +70,11 @@ Startup and window timings can be traced with `ROCH_TRACE=1`; see [`crates/roch-
 Releases are published by hand from the CI run on the tagged commit, so what people download is what CI tested. Build nothing locally for this: a binary built on your own machine links against your own glibc.
 
 ```bash
-gh run download RUN --repo RochStudio/Roch-GPU --name roch-gpu-dist --dir out
-gh run download RUN --repo RochStudio/Roch-GPU --name roch-gpu-dist-linux --dir out
+gh run download RUN --repo 1xroch/Roch-GPU --name roch-gpu-dist --dir out
+gh run download RUN --repo 1xroch/Roch-GPU --name roch-gpu-dist-linux --dir out
 mv out/RochGPU out/RochGPU-linux-x86_64
 (cd out && sha256sum RochGPU.exe RochGPU-linux-x86_64 > SHA256SUMS.txt)
-gh release create vX.Y.Z out/* --repo RochStudio/Roch-GPU --title "Roch GPU X.Y.Z" --notes-file NOTES
+gh release create vX.Y.Z out/* --repo 1xroch/Roch-GPU --title "Roch GPU X.Y.Z" --notes-file NOTES
 ```
 
 Keep those file names. They have no version in them, so the `releases/latest/download/` links in the [Linux guide](linux.md#other-distributions) keep working.
