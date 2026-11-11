@@ -187,6 +187,17 @@ impl GpuIdentity {
         format!("{:.1} GB/s", transfers_mt_s * bus_bits as f64 / 8.0 / 1000.0)
     }
 
+    /// The bus number from a PCI address, `0000:03:00.0` or `03:00.0` (hexadecimal, as Linux writes
+    /// it); `None` for anything else.
+    pub fn pci_bus_number(address: &str) -> Option<u32> {
+        let parts: Vec<&str> = address.trim().split(':').collect();
+        let bus = match parts.as_slice() {
+            [_, bus, _] | [bus, _] => bus,
+            _ => return None,
+        };
+        u32::from_str_radix(bus, 16).ok()
+    }
+
     /// `180 W`.
     pub fn watts_text(watts: f64) -> String {
         if watts.is_finite() && watts > 0.0 { format!("{} W", watts.round()) } else { String::new() }
@@ -316,6 +327,11 @@ mod tests {
         assert_eq!(GpuIdentity::fill_rate_text(0, 144, 2572.0), "");
         assert_eq!(GpuIdentity::bandwidth_text(28_002.0, 128), "448.0 GB/s");
         assert_eq!(GpuIdentity::bandwidth_text(28_002.0, 0), "");
+        assert_eq!(GpuIdentity::pci_bus_number("0000:03:00.0"), Some(3));
+        assert_eq!(GpuIdentity::pci_bus_number("0000:2d:00.0"), Some(0x2D));
+        assert_eq!(GpuIdentity::pci_bus_number("0a:00.0"), Some(10));
+        assert_eq!(GpuIdentity::pci_bus_number("PCI bus 5, slot 0"), None);
+        assert_eq!(GpuIdentity::pci_bus_number(""), None);
         assert_eq!(GpuIdentity::watts_text(180.0), "180 W");
         assert_eq!(GpuIdentity::watts_text(f64::NAN), "");
         // An exact tie rounds away from zero, as .NET's "0.##" does (12416 MB).

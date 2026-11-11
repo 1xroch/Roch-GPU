@@ -546,6 +546,8 @@ impl GpuBackend for AmdgpuBackend {
             .iter()
             .enumerate()
             .map(|(index, card)| GpuDevice {
+                board_vendor: GpuIdentity::board_vendor(card.subsystem_vendor as i32),
+                pci_bus: GpuIdentity::pci_bus_number(&card.pci),
                 index,
                 name: identity::product_name(card.device_id, card.revision),
                 vendor: "AMD".into(),
