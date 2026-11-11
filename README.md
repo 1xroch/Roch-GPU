@@ -39,6 +39,6 @@ On Linux, `cargo xtask install` puts `rochgpu` and a launcher entry in `~/.local
 
 ---
 
-Created by **Roch Studio**. GPL-3.0-or-later · [Technical guide](docs/development.md) · [Third-party notices](THIRD-PARTY-NOTICES.md)
+Created by **Roch** ([@1xroch](https://github.com/1xroch)). GPL-3.0-or-later · [Technical guide](docs/development.md) · [Third-party notices](THIRD-PARTY-NOTICES.md)
 
 [YouTube](https://www.youtube.com/@MateoPcTech) | [X](https://x.com/1xroch) | [Discord](https://discord.gg/KfzExpKQHB)
