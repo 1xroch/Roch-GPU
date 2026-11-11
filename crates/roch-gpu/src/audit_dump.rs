@@ -197,8 +197,10 @@ fn state(o: &mut Out, prefix: &str, s: &GpuTuningState) {
 
 fn graphics_info(o: &mut Out, prefix: &str, g: &GpuGraphicsInfo) {
     fields!(o, prefix, g;
-        gpu, board_manufacturer, code_name, revision, cores, rops_tmus, technology, memory_size,
-        memory_type, memory_vendor, bus_width, bus_interface, resizable_bar, bios_version, bus_address,
+        gpu, board_manufacturer, code_name, revision, device_id, cores, rops_tmus, clocks, fill_rate, tdp,
+        technology, memory_size,
+        memory_type, memory_vendor, bus_width, bandwidth, bus_interface, resizable_bar, bios_version,
+        bus_address,
         driver_version, driver_date);
 }
 

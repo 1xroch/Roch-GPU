@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use roch_core::util::round_even_i32;
-use roch_core::{GpuTelemetry, GpuTuningState, Result};
+use roch_core::{GpuTelemetry, GpuTuningState, Result, SupplementalSensor};
 
 use super::caps::{DOMAIN_GRAPHICS, DOMAIN_MEMORY, PSTATE_P0};
 use super::{ClockDomain, MAX_DOMAIN_TYPE, NvidiaBackend};
@@ -60,6 +60,66 @@ impl NvidiaBackend {
         self.locked_max_mhz = 0;
     }
 
+    /// RTX 50's hot spot, which no driver call reports: read from its register
+    /// ([`private::BLACKWELL_HOTSPOT_REGISTER`]), read-only, once the edge register has confirmed
+    /// the register map against the public GPU temperature. NaN until then, on other cards, and
+    /// while the map does not match. A confirmation is remembered for the session; a failed check
+    /// is not, and runs again on the next sample (one register read): a card first sampled mid-load
+    /// can miss it, and remembering that hid its hot spot and memory chips for the whole session.
+    fn blackwell_hotspot(&mut self, gpu: usize, g: GpuHandle, gpu_temperature_c: f64) -> f64 {
+        match self.blackwell_hotspot_map.get(&gpu) {
+            Some(true) => {}
+            Some(false) => return f64::NAN, // not an RTX 50
+            None => {
+                if !private::is_geforce_rtx_50(&self.device_name(gpu)) {
+                    self.blackwell_hotspot_map.insert(gpu, false);
+                    return f64::NAN;
+                }
+                let confirmed = gpu_temperature_c > 0.0
+                    && private::read_register(g, private::BLACKWELL_EDGE_REGISTER)
+                        .is_ok_and(|edge| private::blackwell_map_confirmed(edge, gpu_temperature_c));
+                if !confirmed {
+                    return f64::NAN; // try again next sample
+                }
+                self.blackwell_hotspot_map.insert(gpu, true);
+            }
+        }
+        private::read_register(g, private::BLACKWELL_HOTSPOT_REGISTER)
+            .ok()
+            .and_then(|raw| private::blackwell_hotspot(raw, gpu_temperature_c))
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Each memory chip's temperature, as Temperatures rows ("Memory chip A0"), on a card whose
+    /// register map the hot spot already confirmed (so RTX 50 only, and never on a chip laid out
+    /// differently) and whose memory is GDDR6X or GDDR7. Which partitions exist is found once, and
+    /// tried again on later samples while none answers; each sample then reads every partition's
+    /// status and data words in one batched call, so the live word of each pair is chosen afresh.
+    /// Back-of-board chips get rows of their own only once they read differently from the front
+    /// ([`private::chip_rows`]). Read-only.
+    fn memory_chip_sensors(&mut self, gpu: usize, g: GpuHandle) -> Vec<SupplementalSensor> {
+        if self.blackwell_hotspot_map.get(&gpu) != Some(&true) {
+            return Vec::new();
+        }
+        let state = self.memory_chips.entry(gpu).or_insert_with(|| super::MemoryChipState {
+            supported: nvapi::ram_type(g).is_ok_and(private::memory_reports_chip_temperatures),
+            ..Default::default()
+        });
+        if !state.supported {
+            return Vec::new();
+        }
+        if state.layout.partitions.is_empty() {
+            let registers = private::memory_layout_registers();
+            state.layout = private::memory_layout(private::register_snapshot(g, &registers));
+        }
+        let read = private::register_snapshot(g, &private::memory_chip_registers(&state.layout));
+        let chips = private::read_memory_chips(&state.layout, read);
+        private::chip_rows(&chips, &mut state.backs_differ)
+            .into_iter()
+            .map(|(id, name, celsius)| SupplementalSensor::new(format!("nv:memchip-{id}"), name, "°C", celsius))
+            .collect()
+    }
+
     pub(super) fn read_telemetry_impl(&mut self, gpu: usize) -> Result<GpuTelemetry> {
         self.forget_lock_across_driver_reset();
         let g = self.gpu(gpu)?;
@@ -100,6 +160,9 @@ impl NvidiaBackend {
             if !mj.is_nan() {
                 mem_temp = mj;
             }
+        }
+        if hotspot.is_nan() {
+            hotspot = self.blackwell_hotspot(gpu, g, temp);
         }
 
         let voltage = nvapi::current_voltage_uv(g).map(|uv| uv as f64 / 1000.0).unwrap_or(f64::NAN);
@@ -151,7 +214,7 @@ impl NvidiaBackend {
         let pstate = nvapi::current_pstate(g).map(perf_state_text).unwrap_or_default();
         let limit_flags = nvapi::performance_limit(g).ok();
         let limit = limit_flags.map(limit_text).unwrap_or_default();
-        let supplemental_sensors = supplemental::read(
+        let mut supplemental_sensors = supplemental::read(
             g,
             nvml_index,
             supplemental::Already {
@@ -161,6 +224,7 @@ impl NvidiaBackend {
                 limit_flags,
             },
         );
+        supplemental_sensors.extend(self.memory_chip_sensors(gpu, g));
 
         Ok(GpuTelemetry {
             core_clock_mhz: core,

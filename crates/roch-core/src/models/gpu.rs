@@ -32,6 +32,13 @@ pub struct GpuDevice {
     pub driver_version: String,
     pub vram_megabytes: i64,
     pub bios_version: String,
+    /// The board maker (MSI, ASUSTeK Computer, ...) from the PCI subsystem vendor; empty when the
+    /// backend does not know it. Only for telling cards apart on screen: identity keys (profiles, the
+    /// recovery journal) never include it.
+    pub board_vendor: String,
+    /// The PCI bus number, when the backend reads it as a number; `bus_id` is its display form.
+    /// Like `board_vendor`, only for telling cards apart on screen.
+    pub pci_bus: Option<u32>,
 }
 
 /// Which shape the core-voltage control takes on this vendor.

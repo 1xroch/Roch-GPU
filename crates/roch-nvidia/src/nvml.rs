@@ -33,6 +33,20 @@ struct NvmlMemory {
 }
 const _: () = assert!(std::mem::size_of::<NvmlMemory>() == 24);
 
+/// `nvmlPciInfo_t`, as `nvmlDeviceGetPciInfo_v3` fills it.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct NvmlPciInfo {
+    bus_id_legacy: [c_char; 16],
+    domain: u32,
+    bus: u32,
+    device: u32,
+    pci_device_id: u32,
+    pci_sub_system_id: u32,
+    bus_id: [c_char; 32],
+}
+const _: () = assert!(std::mem::size_of::<NvmlPciInfo>() == 68);
+
 type InitFn = unsafe extern "C" fn() -> i32;
 type GetHandleFn = unsafe extern "C" fn(u32, *mut Device) -> i32;
 type SetLockedFn = unsafe extern "C" fn(Device, u32, u32) -> i32;
@@ -43,6 +57,7 @@ type GetU32Fn = unsafe extern "C" fn(Device, *mut u32) -> i32;
 type GetClockFn = unsafe extern "C" fn(Device, i32, *mut u32) -> i32;
 type GetMinMaxPStateFn = unsafe extern "C" fn(Device, i32, i32, *mut u32, *mut u32) -> i32;
 type GetMemoryFn = unsafe extern "C" fn(Device, *mut NvmlMemory) -> i32;
+type GetPciInfoFn = unsafe extern "C" fn(Device, *mut NvmlPciInfo) -> i32;
 type GetThresholdFn = unsafe extern "C" fn(Device, i32, *mut u32) -> i32;
 type GetSupportedClocksFn = unsafe extern "C" fn(Device, *mut u32, *mut u32) -> i32;
 type GetSupportedGraphicsFn = unsafe extern "C" fn(Device, u32, *mut u32, *mut u32) -> i32;
@@ -62,6 +77,7 @@ struct Api {
     get_supported_gr_clocks: Option<GetSupportedGraphicsFn>,
     error_string: Option<ErrorStringFn>,
     get_name: Option<GetNameFn>,
+    get_pci_info: Option<GetPciInfoFn>,
     get_power_usage: Option<GetU32Fn>,
     get_default_power_limit: Option<GetU32Fn>,
     get_max_clock: Option<GetClockFn>,
@@ -96,6 +112,7 @@ fn api() -> Result<&'static Api, &'static String> {
                 get_supported_gr_clocks: sym(&lib, "nvmlDeviceGetSupportedGraphicsClocks"),
                 error_string: sym(&lib, "nvmlErrorString"),
                 get_name: sym(&lib, "nvmlDeviceGetName"),
+                get_pci_info: sym(&lib, "nvmlDeviceGetPciInfo_v3"),
                 get_power_usage: sym(&lib, "nvmlDeviceGetPowerUsage"),
                 get_default_power_limit: sym(&lib, "nvmlDeviceGetPowerManagementDefaultLimit"),
                 get_max_clock: sym(&lib, "nvmlDeviceGetMaxClockInfo"),
@@ -533,6 +550,18 @@ pub fn device_name(gpu_index: i32) -> Option<String> {
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+/// PCI bus number as NVML sees it: what tells two cards of the same model apart when lining NVML's
+/// index up with NVAPI's.
+pub fn pci_bus(gpu_index: i32) -> Option<u32> {
+    let mut info = NvmlPciInfo::default();
+    let ok = read(gpu_index, |a, dev| {
+        let f = a.get_pci_info.ok_or_else(|| missing("nvmlDeviceGetPciInfo_v3"))?;
+        // SAFETY: valid out-pointer to a struct of the v3 layout.
+        Ok(unsafe { f(dev, &mut info) })
+    });
+    ok.then_some(info.bus)
 }
 
 /// Unload the session if one is open. Does NOT release a clock cap — deliberately, so a cap

@@ -83,6 +83,8 @@ impl MockBackend {
         Self {
             rng: Rng(42),
             devices: vec![GpuDevice {
+                pci_bus: Some(1),
+                board_vendor: String::new(),
                 index: 0,
                 name: "Simulated RTX 4070 SUPER".into(),
                 vendor: "Mock".into(),
@@ -142,8 +144,19 @@ impl MockBackend {
         second.index = 1;
         second.name = "Simulated RTX 4070 SUPER (2)".into();
         second.bus_id = "PCI bus 2, slot 0".into();
+        second.pci_bus = Some(2);
         m.devices.push(second);
         m.fans.push(m.fans[0]);
+        m
+    }
+
+    /// Two cards of the same model, from the board makers given (as a box with an MSI and an ASUS
+    /// RTX 5060 Ti): same name, different buses.
+    pub fn with_twin_gpus(boards: [&str; 2]) -> Self {
+        let mut m = Self::with_second_gpu();
+        m.devices[1].name = m.devices[0].name.clone();
+        m.devices[0].board_vendor = boards[0].into();
+        m.devices[1].board_vendor = boards[1].into();
         m
     }
 

@@ -18,13 +18,22 @@ pub struct GpuGraphicsInfo {
     pub board_manufacturer: String,
     pub code_name: String,
     pub revision: String,
+    /// `VVVV DDDD - SSSS ssss`: vendor and device, then board vendor and board id (GPU-Z's order).
+    pub device_id: String,
     pub cores: String,
     pub rops_tmus: String,
+    /// The driver's base and boost clocks, as read when the window opened.
+    pub clocks: String,
+    /// ROPs and TMUs at the boost clock.
+    pub fill_rate: String,
+    /// The default board power limit.
+    pub tdp: String,
     pub technology: String,
     pub memory_size: String,
     pub memory_type: String,
     pub memory_vendor: String,
     pub bus_width: String,
+    pub bandwidth: String,
     pub bus_interface: String,
     pub resizable_bar: String,
     pub bios_version: String,
@@ -52,18 +61,23 @@ impl GpuGraphicsInfo {
 
     /// The same field order as Roch Viewer's System Info / Graphics section.
     pub fn rows(&self) -> Vec<GpuGraphicsRow> {
-        let values: [(&str, &str); 17] = [
+        let values: [(&str, &str); 22] = [
             ("GPU", &self.gpu),
             ("Board Manufacturer", &self.board_manufacturer),
             ("GPU Code Name", &self.code_name),
             ("GPU Revision", &self.revision),
+            ("Device ID", &self.device_id),
             ("Cores", &self.cores),
             ("ROPs / TMUs", &self.rops_tmus),
+            ("Base / Boost Clock", &self.clocks),
+            ("Pixel / Texture Fill", &self.fill_rate),
+            ("TDP", &self.tdp),
             ("GPU Technology", &self.technology),
             ("Memory Size", &self.memory_size),
             ("Memory Type", &self.memory_type),
             ("Memory Vendor", &self.memory_vendor),
             ("Bus Width", &self.bus_width),
+            ("Bandwidth", &self.bandwidth),
             ("Bus Interface", &self.bus_interface),
             ("Resizable BAR", &self.resizable_bar),
             ("VBIOS", &self.bios_version),
@@ -134,6 +148,48 @@ impl GpuIdentity {
             return format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8]);
         }
         parse_loose_date(raw).unwrap_or_default()
+    }
+
+    /// GPU-Z's device id: `10DE 2D04 - 1462 5351`. Each word packs its device over its vendor, as
+    /// PCI configuration space does. Empty when the driver gave no ids.
+    pub fn device_id_text(vendor_device: u32, subsystem: u32) -> String {
+        if vendor_device == 0 {
+            return String::new();
+        }
+        let word = |w: u32| format!("{:04X} {:04X}", w & 0xFFFF, w >> 16);
+        if subsystem == 0 { word(vendor_device) } else { format!("{} - {}", word(vendor_device), word(subsystem)) }
+    }
+
+    /// `2407 / 2572 MHz`; one side alone when the other is unknown.
+    pub fn clocks_text(base_mhz: f64, boost_mhz: f64) -> String {
+        match (base_mhz > 0.0, boost_mhz > 0.0) {
+            (true, true) => format!("{} / {} MHz", base_mhz.round(), boost_mhz.round()),
+            (true, false) => format!("{} MHz", base_mhz.round()),
+            (false, true) => format!("{} MHz boost", boost_mhz.round()),
+            (false, false) => String::new(),
+        }
+    }
+
+    /// `123.5 GPixel/s / 370.4 GTexel/s`: every ROP and TMU once per clock at the boost clock.
+    pub fn fill_rate_text(rops: i32, tmus: i32, boost_mhz: f64) -> String {
+        if rops <= 0 || tmus <= 0 || boost_mhz <= 0.0 {
+            return String::new();
+        }
+        let giga = |units: i32| format!("{:.1}", units as f64 * boost_mhz / 1000.0);
+        format!("{} GPixel/s / {} GTexel/s", giga(rops), giga(tmus))
+    }
+
+    /// Peak memory bandwidth from the transfer rate per pin and the bus width: `448.0 GB/s`.
+    pub fn bandwidth_text(transfers_mt_s: f64, bus_bits: u32) -> String {
+        if transfers_mt_s <= 0.0 || bus_bits == 0 {
+            return String::new();
+        }
+        format!("{:.1} GB/s", transfers_mt_s * bus_bits as f64 / 8.0 / 1000.0)
+    }
+
+    /// `180 W`.
+    pub fn watts_text(watts: f64) -> String {
+        if watts.is_finite() && watts > 0.0 { format!("{} W", watts.round()) } else { String::new() }
     }
 
     /// Maximum PCIe link capability. The currently power-saving link is deliberately omitted so
@@ -250,6 +306,18 @@ mod tests {
         assert_eq!(GpuIdentity::pcie_bus_interface(0, 0, 0, 0), "");
         assert_eq!(format_gb(12282.0 / 1024.0), "11.99 GB");
         assert_eq!(format_gb(16.0), "16 GB");
+        // What GPU-Z and CPU-Z show for an MSI RTX 5060 Ti (NVAPI packs device over vendor).
+        assert_eq!(GpuIdentity::device_id_text(0x2D04_10DE, 0x5351_1462), "10DE 2D04 - 1462 5351");
+        assert_eq!(GpuIdentity::device_id_text(0x2D04_10DE, 0), "10DE 2D04");
+        assert_eq!(GpuIdentity::device_id_text(0, 0), "");
+        assert_eq!(GpuIdentity::clocks_text(2407.0, 2572.0), "2407 / 2572 MHz");
+        assert_eq!(GpuIdentity::clocks_text(0.0, 0.0), "");
+        assert_eq!(GpuIdentity::fill_rate_text(48, 144, 2572.0), "123.5 GPixel/s / 370.4 GTexel/s");
+        assert_eq!(GpuIdentity::fill_rate_text(0, 144, 2572.0), "");
+        assert_eq!(GpuIdentity::bandwidth_text(28_002.0, 128), "448.0 GB/s");
+        assert_eq!(GpuIdentity::bandwidth_text(28_002.0, 0), "");
+        assert_eq!(GpuIdentity::watts_text(180.0), "180 W");
+        assert_eq!(GpuIdentity::watts_text(f64::NAN), "");
         // An exact tie rounds away from zero, as .NET's "0.##" does (12416 MB).
         assert_eq!(format_gb(12.125), "12.13 GB");
     }
@@ -257,7 +325,7 @@ mod tests {
     #[test]
     fn rows_band_and_dash() {
         let rows = GpuGraphicsInfo { gpu: "X".into(), ..Default::default() }.rows();
-        assert_eq!(rows.len(), 17);
+        assert_eq!(rows.len(), 22);
         assert_eq!(rows[0].value, "X");
         assert!(!rows[0].is_banded && rows[1].is_banded);
         assert_eq!(rows[1].value, "—");
