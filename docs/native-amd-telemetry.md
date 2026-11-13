@@ -18,12 +18,25 @@ PowerColor RX 9070 XT, AMD driver 26.3.1, vBIOS 023.008.000.068:
 | GPU / memory-controller utilization | PMLog | Supported |
 | Dedicated VRAM used — newly working | ADLX | 292 MB |
 | Shared GPU memory used — new | ADLX revision 2 | 67 MB |
-| PCIe generation / lanes / maximum generation — new | PMLog | 4 / 16 / 5 |
+| PCIe generation / lanes / maximum generation — new | PMLog | 5 / 16 / 5 (raw 4 / 16 / 5, see below) |
 
 These are different acquisition times, not calibration comparisons to another
 application. Existing temperature, voltage, power and clock channels are **not**
 claimed as new sensors. The new memory readings replace the old unavailable/zero
 allocation value; they are not copied from another monitoring application.
+
+### PCIe link speed on RDNA 4
+
+On this card PMLog sensor 40 (`ADL_PMLOG_BUS_SPEED`) is a zero-based speed index,
+not the generation: with driver 26.10.2 on an X870 board it read 4 while the Link
+Status register of the CPU's root port and of the card's own upstream switch port
+both read 32 GT/s (PCIe 5.0), and HWiNFO 8.52 showed 32.0 GT/s. Sensor 41 is the
+lane count as negotiated (2 at idle, where the card narrows its link, matching both
+Link Status registers; 16 in the sample above), and sensor 58 the maximum generation
+(5, matching Link Capabilities). Roch GPU adds one to sensor 40 on RDNA 4 (PCI device
+0x75xx) only; other generations keep the raw value until measured the same way. The
+GPU's own config space is no help here: behind the card's switch it always reports the
+internal x16 link.
 
 ## Conditional support, not verified extra readings on this card
 
