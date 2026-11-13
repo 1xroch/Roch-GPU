@@ -38,6 +38,13 @@ Link Status registers; 16 in the sample above), and sensor 58 the maximum genera
 GPU's own config space is no help here: behind the card's switch it always reports the
 internal x16 link.
 
+The header's PCIe Bus line puts the two together as GPU-Z does, "5.0 x16 @ 5.0 x2": the
+maximum from sensor 58 and Windows' PCI properties for the GPU function (its Link Capabilities,
+x16), then the live link from sensors 40 and 41. No AMD interface on this card reports the
+full-power width: ADLX's IADLXGPU1 lane width is the same live x2, the Overdrive 5 and 6 activity
+calls are refused, and the WDDM performance caps carry a placeholder. In a slot narrower than the
+card, the live half under load is where that shows.
+
 ## Conditional support, not verified extra readings on this card
 
 The mapper also supports native FCLK and SoC clocks, UVD/VCE/VCN clocks, core and
