@@ -24,7 +24,7 @@ use super::tray::{Tray, TrayCommand};
 use super::view_model::{Job, MainViewModel, Outcome};
 use super::windows::curve::CurveWindow;
 use super::windows::fan::FanWindow;
-use super::windows::graphics::GraphicsWindow;
+use super::windows::info::InfoWindow;
 use super::windows::main_window::{self, MainAction};
 use super::windows::monitor::MonitorWindow;
 use super::windows::xoc::XocWindow;
@@ -107,7 +107,7 @@ pub struct RochApp {
     fan: Option<FanWindow>,
     curve: Option<CurveWindow>,
     xoc: Option<XocWindow>,
-    graphics: Option<GraphicsWindow>,
+    info_window: Option<InfoWindow>,
     /// The tray icon is made after the first frame (it is a few ms of shell calls the window
     /// need not wait for), unless the app starts in the tray.
     tray_due: bool,
@@ -193,7 +193,7 @@ impl RochApp {
             fan: None,
             curve: None,
             xoc: None,
-            graphics: None,
+            info_window: None,
             tray_due: !minimized,
             first_frame_drawn: false,
             frames: 0,
@@ -231,7 +231,7 @@ impl RochApp {
         self.fan = None;
         self.curve = None;
         self.xoc = None;
-        self.graphics = None;
+        self.info_window = None;
         self.settings_window = None;
         self.update_poll_detail();
         self.hidden = true;
@@ -452,10 +452,13 @@ impl RochApp {
                     m.focus();
                 }
             }
-            MainAction::OpenGraphics => match &mut self.graphics {
-                Some(w) => w.focus(),
-                None => self.graphics = Some(GraphicsWindow::new(&self.shared.service.read_graphics_info())),
-            },
+            MainAction::ToggleInfo => {
+                self.info_window = if self.info_window.is_none() {
+                    Some(InfoWindow::new(&self.shared.service.read_graphics_info()))
+                } else {
+                    None
+                };
+            }
             MainAction::OpenLog => {
                 let path = self.shared.log_path();
                 if !path.exists() {
@@ -503,7 +506,9 @@ impl RochApp {
         self.fan = None;
         self.curve = None;
         self.xoc = None;
-        self.graphics = None;
+        if let Some(window) = &mut self.info_window {
+            window.set_info(self.vm.graphics_info());
+        }
         if let Some(monitor) = &mut self.monitor {
             monitor.reset_for_new_gpu();
         }
@@ -521,10 +526,10 @@ impl RochApp {
         {
             self.xoc = None;
         }
-        if let Some(win) = &mut self.graphics
+        if let Some(win) = &mut self.info_window
             && !win.show(ctx, &mut w)
         {
-            self.graphics = None;
+            self.info_window = None;
         }
         if let Some(win) = &mut self.curve
             && !win.show(ctx, &mut w)
@@ -635,7 +640,7 @@ impl RochApp {
                 "Roch GPU",
                 "Roch GPU — Settings",
                 "Roch GPU — Telemetry",
-                "Roch GPU — Graphics",
+                InfoWindow::TITLE,
                 "XOC",
                 "Fan Control",
                 "Voltage / Frequency curve",
@@ -735,7 +740,7 @@ impl RochApp {
             (self.fan.is_some(), "fan"),
             (self.curve.is_some(), "curve"),
             (self.xoc.is_some(), "xoc"),
-            (self.graphics.is_some(), "graphics"),
+            (self.info_window.is_some(), "info"),
         ]
         .into_iter()
         .filter_map(|(on, name)| on.then_some(name))
@@ -761,14 +766,14 @@ impl RochApp {
             Step::Open(Win::Curve) => self.handle_action(ctx, MainAction::OpenCurve),
             Step::Open(Win::Xoc) => self.handle_action(ctx, MainAction::OpenXoc),
             Step::Open(Win::Fan) => self.handle_action(ctx, MainAction::OpenFan),
-            Step::Open(Win::Graphics) => self.handle_action(ctx, MainAction::OpenGraphics),
+            Step::Open(Win::Info) => self.handle_action(ctx, MainAction::ToggleInfo),
             Step::Close(Win::Curve) => self.curve = None,
             Step::Close(Win::Xoc) => self.xoc = None,
             Step::Close(Win::Fan) => {
                 self.fan = None;
                 self.update_poll_detail();
             }
-            Step::Close(Win::Graphics) => self.graphics = None,
+            Step::Close(Win::Info) => self.info_window = None,
             Step::Exit => {
                 self.really_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);

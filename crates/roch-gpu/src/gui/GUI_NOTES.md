@@ -1,7 +1,7 @@
 # GUI port notes (WPF `GpuTuner.App` → eframe/egui)
 
 Handoff file for the GUI port. Part 1 = app shell, theme, tray, view model, main window, XOC and
-Graphics windows. Part 2 = Monitor, Fan and V/F Curve windows. Both parts are done.
+Info windows. Part 2 = Monitor, Fan and V/F Curve windows. Both parts are done.
 
 Stack: eframe/egui **0.37** with the **glow** renderer (`default-features = false`, features
 `glow`, `clipboard`; no `default_fonts`, see Theme API), `tray-icon` 0.26, `image` 0.25 (png only, already pulled in by
@@ -27,7 +27,7 @@ eframe). eframe 0.37's `App` trait is `logic(ctx, frame)` + `ui(ui, frame)` (no 
   logon task: the checkbox reflects the *real* Task Scheduler entry (`schtasks /Query`), and
   toggling re-registers/unregisters it (faithful WPF behaviour).
 * `cargo test -p roch-gpu` — view-model tests in `gui/tests.rs` (mock backend, temp store, fake
-  logon task), plus unit tests in `format.rs`, `assets.rs`, `startup.rs`, `windows/graphics.rs`,
+  logon task), plus unit tests in `format.rs`, `assets.rs`, `startup.rs`, `windows/info.rs`,
   `telemetry_table.rs`, `fan_editor.rs`, `vf_editor.rs`, `windows/fan.rs`, `windows/monitor.rs`.
 * Visual checks: launch with `--mock --isolated` and `APPDATA` pointed at a scratch folder, then
   inspect the main and child windows, including large text, scaling and scrolling.
@@ -43,7 +43,7 @@ eframe). eframe 0.37's `App` trait is `logic(ctx, frame)` + `ui(ui, frame)` (no 
 | `app.rs` | `MainWindow.xaml.cs` | `RochApp`: worker thread, tray, hide-to-tray, child windows, modal dialogs, poll background mode, live settings, close-with-fan prompt |
 | `windows/main_window.rs` | `MainWindow.xaml` | draws the root viewport, returns `MainAction`s |
 | `windows/xoc.rs` | `XocWindow` | done |
-| `windows/graphics.rs` | `GraphicsWindow` | done |
+| `windows/info.rs` | `GraphicsWindow` | done |
 | `windows/monitor.rs` | `MonitorWindow.xaml(.cs)` | summary cards, sensor table, Open at launch switch, Reset statistics |
 | `windows/fan.rs` | `FanWindow.xaml(.cs)` | modes, per-fan sliders, Zero RPM, curve editor painting + pointer handling, point rows, Apply |
 | `windows/curve.rs` | `CurveWindow.xaml(.cs)` | toolbar (flatten / remove / reload / reset / apply), V/F editor painting + pointer/keys |
@@ -79,7 +79,7 @@ eframe). eframe 0.37's `App` trait is `logic(ctx, frame)` + `ui(ui, frame)` (no 
   Native title lookup enumerates the calling UI thread only. Reading titles on driver/helper
   threads can send synchronous cross-thread messages and stall interaction.
   Renderers share an immutable `Arc<Prefs>` snapshot; publish a new snapshot after edits.
-* Placement: `Placement::RightOfOwner` (Monitor, Graphics: `Left = main.Right + 8`), `CenterOwner`
+* Placement: `Placement::RightOfOwner` (Monitor, Info: `Left = main.Right + 8`), `CenterOwner`
   (XOC, Fan, Curve). Build the viewport with `self.chrome.builder(title, size, icon, placement,
   main_rect)`: the position is worked out once, on open (part 2 fix — recomputing it from the main
   window every frame dragged every child along whenever the main window grew a line).
@@ -190,7 +190,7 @@ controls (graphs, curve editors) should read `pal(ui.ctx())` every frame.
   for the new card, saves `AppSettings.gpu_index`, and rebuilds itself with `MainViewModel::new`
   (capabilities, current tuning, last profile, slots). `select_gpu` releases the software fan
   curve and temperature limit on the old card before moving; `RochApp::select_gpu` drops the
-  Fan/Curve/XOC/Graphics windows built for the old capabilities and resets the Telemetry table.
+  Fan/Curve/XOC windows built for the old capabilities, refreshes Info, and resets the Telemetry table.
 * At launch, `startup::start` uses `TuningService::initialize_preferred(settings.gpu_index)`:
   an index that no longer exists falls back to the first card instead of refusing to start.
   The CLI's `--gpu` remains strict.
@@ -207,8 +207,9 @@ controls (graphs, curve editors) should read `pal(ui.ctx())` every frame.
   which v1.1.0's palette makes equal to the background (so, as in v1.1.0, no visible bands). The
   scrollbar is the WPF grip: 9 px, muted at 30/65/80%. "Open at launch" writes
   `AppSettings::auto_open_monitor` at once. `RochApp::pump` no longer forwards samples to it.
-* **Fan** — "Fan Control", width 560 (min 460), height to content. Radio mode is local until Apply
-  (as WPF). Apply = one `queue_custom("Applying fans…")`: `set_fans(mode, %, per_fan, &curve,
+* **Fan** — "Fan Control", width 560 (min 460), height to content. Mode, duties and curve edits
+  share the main editor, so saving a profile includes them before Apply. Apply = one
+  `queue_custom("Applying fans…")`: `set_fans(mode, %, per_fan, &curve,
   zero_rpm)`; on success `sync_fans_from_service` + `save_fans_to_active_slot`; the status comes back
   through an `Arc<Mutex<Option<(String, bool)>>>`. Per-fan captions from `on_telemetry`. Hardware
   curves (`fan_curve_is_hardware`) hide Hysteresis/Min step, and the editor refuses to add points
@@ -230,7 +231,7 @@ instance (`claim` + show-request listener), hide-to-tray + tray menu + tooltip, 
 prompt, light/dark theme with persisted preference and dark title bars on decorated windows,
 main window (header, window buttons, all sliders incl. AMD offset/timing and Intel clock range,
 profile bar with two-step Save, right-click clear, Startup + profile combo, Apply/Reset, pending
-line, summary, footer links + status), XOC window, Graphics window, worker-thread writes, log file,
+line, summary, footer links + status), XOC window, Info window, worker-thread writes, log file,
 panic log.
 
 Deviations: see the report in the PR/hand-off; notably the software temperature limit row (a new

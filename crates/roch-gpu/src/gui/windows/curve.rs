@@ -192,7 +192,7 @@ impl CurveWindow {
             .builder("Voltage / Frequency curve", vec2(960.0, 620.0), w.icon, Placement::CenterOwner, w.main_rect)
             .with_min_inner_size(self.chrome.min_size(vec2(700.0, 460.0)));
         ctx.show_viewport_immediate(Self::id(), builder, |ui, _class: ViewportClass| {
-            let closed = self.chrome.frame(ui.ctx(), w.dark);
+            let closed = self.chrome.frame(ui, w.dark);
             content_frame(ui.ctx(), 12).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 self.body(ui, w);

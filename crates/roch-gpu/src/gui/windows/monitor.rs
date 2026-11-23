@@ -162,7 +162,7 @@ impl MonitorWindow {
             .builder("Roch GPU — Telemetry", vec2(800.0, 900.0), w.icon, Placement::RightOfOwner, w.main_rect)
             .with_min_inner_size(self.chrome.min_size(vec2(740.0, 480.0)));
         ctx.show_viewport_immediate(Self::id(), builder, |ui, _class: ViewportClass| {
-            let closed = self.chrome.frame(ui.ctx(), w.dark);
+            let closed = self.chrome.frame(ui, w.dark);
             content_frame(ui.ctx(), 0).inner_margin(egui::Margin { left: 20, right: 20, top: 16, bottom: 14 }).show(
                 ui,
                 |ui| {

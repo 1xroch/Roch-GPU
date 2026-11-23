@@ -1618,9 +1618,6 @@ impl TuningService {
             }
         }
 
-        if caps.can_set_zero_rpm {
-            a.run("Zero RPM", drv.backend.set_zero_rpm(gpu, p.zero_rpm));
-        }
         if caps.can_set_memory_timing {
             a.run("Memory timing", drv.backend.set_memory_timing(gpu, p.memory_timing_level));
         }
@@ -1629,6 +1626,9 @@ impl TuningService {
             let (mode, pct, per_fan, curve) =
                 (p.fan_mode, p.fixed_fan_percent, p.fixed_fan_percents.clone(), p.fan_curve.clone());
             write_fans(drv, &caps, gpu, mode, pct, &per_fan, &curve, &mut a);
+        }
+        if caps.can_set_zero_rpm {
+            a.run("Zero RPM", drv.backend.set_zero_rpm(gpu, p.zero_rpm));
         }
 
         if st.manual_curve_active && !caps.can_edit_vf_curve && (caps.can_set_voltage_curve || caps.can_set_core_offset)

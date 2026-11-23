@@ -358,16 +358,17 @@ impl TelemetryTable {
     /// A sensor first seen after the table was built goes at the end of its group (created at
     /// the bottom when the card had none of that kind before).
     fn insert_sensor(&mut self, key: &str, name: &str, unit: &str) {
-        let group = match unit {
-            "°C" => "TEMPERATURES",
-            "mV" | "V" => "VOLTAGES",
-            "MHz" => "CLOCKS",
-            "MB/s" | "GB/s" => "MEMORY BANDWIDTH",
-            "W" => "POWER",
-            "MB" => "MEMORY",
-            "gen" | "lanes" | "GT/s" => "PCIe LINK",
-            "%" => "LOAD",
-            "A" => "RAIL CURRENT",
+        let group = match (key, unit) {
+            ("amdgpu:vram_usage" | "amdgpu:gtt_usage", "%") => "MEMORY",
+            (_, "°C") => "TEMPERATURES",
+            (_, "mV" | "V") => "VOLTAGES",
+            (_, "MHz") => "CLOCKS",
+            (_, "MB/s" | "GB/s") => "MEMORY BANDWIDTH",
+            (_, "W") => "POWER",
+            (_, "MB") => "MEMORY",
+            (_, "gen" | "lanes" | "GT/s") => "PCIe LINK",
+            (_, "%") => "LOAD",
+            (_, "A") => "RAIL CURRENT",
             _ => "LIMITERS",
         }
         .to_uppercase();
@@ -563,6 +564,24 @@ mod tests {
         assert!(t.rows().iter().any(|r| r.is_header && r.name == "MEMORY BANDWIDTH"), "bandwidth gets its own group");
         assert_eq!(row(&t, "Memory voltage").current, "1.352 V", "memory voltage retains precision");
         assert_eq!(row(&t, "GPU power").current, "110.2 W", "GPU power rendered");
+    }
+
+    #[test]
+    fn amd_memory_occupancy_is_grouped_apart_from_engine_load() {
+        let sample = GpuTelemetry {
+            supplemental_sensors: vec![
+                sup("amdgpu:vram_usage", "Dedicated VRAM occupancy", "%", 84.0),
+                sup("amdgpu:gtt_usage", "Shared GPU memory occupancy", "%", 1.5),
+                sup("amdgpu:video_load", "Video engine", "%", 0.0),
+            ],
+            ..empty()
+        };
+        let mut table = TelemetryTable::new(&sample, &GpuCapabilities::default(), []);
+        table.add(&sample, None);
+        assert_eq!(group_of(&table, "Dedicated VRAM occupancy"), "MEMORY");
+        assert_eq!(group_of(&table, "Shared GPU memory occupancy"), "MEMORY");
+        assert_eq!(group_of(&table, "Video engine"), "LOAD");
+        assert_eq!(row(&table, "Video engine").current, "0.0 %");
     }
 
     #[test]

@@ -36,7 +36,7 @@ impl XocWindow {
             .with_resizable(false);
         let vm = &mut *w.vm;
         ctx.show_viewport_immediate(Self::id(), builder, |ui, _class: ViewportClass| {
-            let closed = self.chrome.frame(ui.ctx(), w.dark);
+            let closed = self.chrome.frame(ui, w.dark);
             let resp = content_frame(ui.ctx(), 12).show(ui, |ui| {
                 ui.set_width(WIDTH * theme::text_factor() - 24.0);
                 egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| body(ui, vm)).content_size.y

@@ -70,6 +70,7 @@ impl Tree {
             ("device", "0x744c\n"),
             ("revision", "0xcc\n"),
             ("subsystem_vendor", "0x1da2\n"),
+            ("subsystem_device", "0x471e\n"),
             ("boot_vga", "0\n"),
             ("power/runtime_status", "active\n"),
             ("power_state", "D0\n"),
@@ -566,7 +567,12 @@ fn older_cards_are_driven_through_hwmon() {
 
 #[test]
 fn telemetry_comes_from_hwmon_and_metrics() {
-    let (tree, _) = rdna3("telemetry");
+    let (tree, device) = rdna3("telemetry");
+    fs::write(device.join("hwmon/hwmon3/temp2_crit"), "110000\n").unwrap();
+    fs::write(device.join("mem_info_gtt_total"), "4194304000\n").unwrap();
+    let mut metrics = METRICS;
+    metrics[20..22].copy_from_slice(&12u16.to_le_bytes());
+    fs::write(device.join("gpu_metrics"), metrics).unwrap();
     let (mut b, _) = backend(&tree);
     let t = b.read_telemetry(0).unwrap();
     assert_eq!((t.core_clock_mhz, t.memory_clock_mhz), (26.0, 96.0));
@@ -585,6 +591,10 @@ fn telemetry_comes_from_hwmon_and_metrics() {
     assert_eq!(sensor("amdgpu:power_cap"), Some(265.0));
     assert_eq!(sensor("amdgpu:pcie_gen"), Some(4.0));
     assert_eq!(sensor("amdgpu:pcie_width"), Some(8.0));
+    assert_eq!(sensor("amdgpu:hotspot_headroom"), Some(60.0));
+    assert_eq!(sensor("amdgpu:video_load"), Some(12.0));
+    assert_eq!(sensor("amdgpu:gtt_usage"), Some(2.5));
+    assert!((sensor("amdgpu:vram_usage").unwrap() - 2.86).abs() < 0.01);
     assert_eq!(b.read_temperature_only(0).unwrap().temperature_c, 43.0);
 }
 
@@ -911,6 +921,25 @@ fn zero_rpm_is_written_and_committed() {
 }
 
 #[test]
+fn disabling_zero_rpm_again_refreshes_the_setting_if_the_fan_is_stopped() {
+    let (tree, device) = rdna3("zero-refresh");
+    let (mut b, sim) = backend(&tree);
+    b.set_zero_rpm(0, false).unwrap();
+    let writes = sim.log().len();
+
+    b.set_zero_rpm(0, false).unwrap();
+    assert_eq!(sim.log().len(), writes, "a spinning fan does not need a refresh");
+
+    fs::write(device.join("hwmon/hwmon3/fan1_input"), "0\n").unwrap();
+    b.set_zero_rpm(0, false).unwrap();
+    assert_eq!(
+        sim.log()[writes..],
+        ["fan_zero_rpm_enable 1", "fan_zero_rpm_enable c", "fan_zero_rpm_enable 0", "fan_zero_rpm_enable c"]
+    );
+    assert!(!b.read_tuning_state(0).unwrap().zero_rpm);
+}
+
+#[test]
 fn reset_restores_everything_and_reports_what_failed() {
     let (tree, device) = rdna3("reset");
     fs::write(device.join(PERFORMANCE_LEVEL_FILE), "manual\n").unwrap();
@@ -1133,6 +1162,8 @@ fn graphics_info_names_the_board() {
     let info = b.read_graphics_info(0);
     assert_eq!(info.board_manufacturer, "Sapphire Technology");
     assert_eq!(info.revision, "CC");
+    assert_eq!(info.device_id, "1002 744C - 1DA2 471E");
+    assert_eq!(info.tdp, "265 W");
     assert_eq!(info.memory_vendor, "Samsung");
     assert_eq!(info.bus_interface, "4.0 x16");
     assert_eq!(info.bios_version, "113-D70401XT-P11");

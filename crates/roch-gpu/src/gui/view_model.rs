@@ -282,6 +282,7 @@ pub struct MainViewModel {
     fan_mode_index: i32,
     per_fan_percents: Vec<i32>,
     editor_curve: FanCurve,
+    fan_curve_revision: u64,
     xoc_armed: XocLever,
     pending_changes: bool,
     /// Fan edits apart from the rest: the fan window's own Apply writes these and clears only them.
@@ -335,6 +336,7 @@ impl MainViewModel {
             fan_mode_index: 0,
             per_fan_percents: Vec::new(),
             editor_curve: FanCurve::default(),
+            fan_curve_revision: 0,
             xoc_armed: XocLever::NONE,
             pending_changes: false,
             pending_fan_changes: false,
@@ -549,8 +551,8 @@ impl MainViewModel {
         }
     }
 
-    pub fn device_display_name(&self) -> String {
-        let name = if self.device.vram_megabytes > 0 {
+    pub fn device_model_name(&self) -> String {
+        if self.device.vram_megabytes > 0 {
             format!(
                 "{} ({}GB)",
                 self.device.name,
@@ -558,7 +560,22 @@ impl MainViewModel {
             )
         } else {
             self.device.name.clone()
-        };
+        }
+    }
+
+    pub fn device_board_line(&self) -> String {
+        let board = self.device.board_vendor.trim();
+        let tag = self.twin_tag(self.gpu_index);
+        match (board.is_empty(), tag.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => format!("PCIe address: {tag}"),
+            (false, true) => format!("Board: {board}"),
+            (false, false) => format!("Board: {tag}"),
+        }
+    }
+
+    pub fn device_display_name(&self) -> String {
+        let name = self.device_model_name();
         let tag = self.twin_tag(self.gpu_index);
         if tag.is_empty() { name } else { format!("{name} · {tag}") }
     }
@@ -989,7 +1006,10 @@ impl MainViewModel {
             Field::ClockLockMin | Field::ClockLockMax => {
                 (c.clock_lock_min_mhz, c.clock_lock_min_mhz.max(c.clock_lock_max_mhz))
             }
-            Field::FixedFan => (c.fan_min_percent, c.fan_max_percent),
+            Field::FixedFan => {
+                let max = if c.fan_max_percent <= 0 { 100 } else { c.fan_max_percent };
+                (c.fan_min_percent, max.max(c.fan_min_percent))
+            }
             Field::NvvddOcpAmps => (self.nvvdd_ocp_min_a(), self.nvvdd_ocp_max_a()),
             Field::MsvddOcpAmps => (self.msvdd_ocp_min_a(), self.msvdd_ocp_max_a()),
             Field::SoftTempLimit => c.soft_thermal_limit_range(),
@@ -1175,6 +1195,15 @@ impl MainViewModel {
     pub fn per_fan_percents(&self) -> &[i32] {
         &self.per_fan_percents
     }
+
+    pub fn set_fixed_fan_settings(&mut self, percent: i32, per_fan: &[i32]) {
+        self.set(Field::FixedFan, percent);
+        if self.per_fan_percents != per_fan {
+            self.per_fan_percents = per_fan.to_vec();
+            self.dirty_fans();
+        }
+    }
+
     /// The fan-curve editor's working copy; the fan window edits it in place, then calls
     /// [`Self::mark_curve_dirty`].
     pub fn editor_curve(&self) -> &FanCurve {
@@ -1183,6 +1212,9 @@ impl MainViewModel {
     pub fn editor_curve_mut(&mut self) -> &mut FanCurve {
         &mut self.editor_curve
     }
+    pub fn fan_curve_revision(&self) -> u64 {
+        self.fan_curve_revision
+    }
     pub fn mark_curve_dirty(&mut self) {
         self.dirty_fans();
     }
@@ -1190,8 +1222,7 @@ impl MainViewModel {
     /// The fan window wrote to the card; bring this window's controls into line with it. The fans
     /// are now applied, so only edits to everything else still count as unapplied.
     pub fn sync_fans_from_service(&mut self, mode: FanMode, percent: i32, per_fan: &[i32]) {
-        self.set(Field::FixedFan, percent);
-        self.per_fan_percents = per_fan.to_vec();
+        self.set_fixed_fan_settings(percent, per_fan);
         self.set_fan_mode_index(mode.as_number());
         self.pending_fan_changes = false;
         self.refresh_applied_summary();
@@ -2136,6 +2167,7 @@ impl MainViewModel {
         self.set(Field::FixedFan, p.fixed_fan_percent);
         self.per_fan_percents = p.fixed_fan_percents.clone();
         self.editor_curve = p.fan_curve.clone_config();
+        self.fan_curve_revision += 1;
         self.loading_editor = false;
     }
 

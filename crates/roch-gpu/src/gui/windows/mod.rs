@@ -9,7 +9,7 @@
 
 pub mod curve;
 pub mod fan;
-pub mod graphics;
+pub mod info;
 pub mod main_window;
 pub mod monitor;
 pub mod xoc;
@@ -46,14 +46,14 @@ pub enum Placement {
     RightOfOwner,
 }
 
-/// Builder for a decorated child window with the app icon, at `pos` when given. Pop-ups carry only
-/// a close button: they belong to the main window, which is the one that minimizes.
+/// Child windows use a native title bar on Windows and draw their own on Linux.
 fn child_builder(title: &str, size: Vec2, icon: &Arc<IconData>, pos: Option<Pos2>) -> ViewportBuilder {
     let b = ViewportBuilder::default()
         .with_title(title)
         .with_app_id("RochGPU")
         .with_inner_size(size)
         .with_icon(icon.clone())
+        .with_decorations(!cfg!(target_os = "linux"))
         .with_minimize_button(false)
         .with_maximize_button(false);
     match pos {
@@ -96,6 +96,7 @@ pub struct ChildChrome {
 /// so the window is still resizable. Hyprland decides on the first buffer, which the first frame
 /// delivers; three leaves room for a frame or two more on a busy desktop.
 const OPENING_FRAMES: u8 = 3;
+const CHILD_TITLE_HEIGHT: f32 = if cfg!(target_os = "linux") { 30.0 } else { 0.0 };
 
 impl ChildChrome {
     /// The viewport builder: placed beside or over the main window when it opens, then left
@@ -137,7 +138,8 @@ impl ChildChrome {
     }
 
     /// Call at the top of the viewport's ui callback. Returns true when the user closed it.
-    pub fn frame(&mut self, ctx: &Context, dark: bool) -> bool {
+    pub fn frame(&mut self, ui: &mut egui::Ui, dark: bool) -> bool {
+        let ctx = ui.ctx();
         // eframe clears a child window to fully transparent. Windows shows that as black and a Wayland
         // compositor shows what is behind the window, so paint the theme background under everything:
         // a window held taller than its content (XOC's minimum height on a card without the MSVDD
@@ -186,7 +188,40 @@ impl ChildChrome {
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
-        ctx.input(|i| i.viewport().close_requested())
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        close_requested || (cfg!(target_os = "linux") && self.title_bar(ui))
+    }
+
+    fn title_bar(&self, ui: &mut egui::Ui) -> bool {
+        let palette = theme::pal(ui.ctx());
+        egui::Panel::top("child_title_bar")
+            .exact_size(CHILD_TITLE_HEIGHT)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(palette.panel))
+            .show(ui, |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), CHILD_TITLE_HEIGHT), egui::Sense::hover());
+                let button_width = 44.0;
+                let drag_rect = Rect::from_min_max(rect.min, rect.max - vec2(button_width, 0.0));
+                let drag = ui.interact(drag_rect, ui.scope_id().with("drag"), egui::Sense::drag());
+                if drag.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                ui.painter().with_clip_rect(drag_rect).text(
+                    drag_rect.left_center() + vec2(10.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    &self.title,
+                    theme::bold(theme::BODY),
+                    palette.text,
+                );
+                let mut button = ui.new_child(
+                    egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                super::widgets::title_button(&mut button, "×", button_width, true, 20.0)
+                    .on_hover_text("Close")
+                    .clicked()
+            })
+            .inner
     }
 
     /// Bring the window forward on its next frame (clicking its button again).
@@ -196,7 +231,11 @@ impl ChildChrome {
 
     /// WPF `SizeToContent`: resize the window to `size` when the content's size changed.
     pub fn fit(&mut self, ctx: &Context, size: Vec2) {
-        let size = Vec2::new(size.x.round(), size.y.round()).min(maximum_size(ctx));
+        // The initial fixed-size limits would discard this request. Fit once they are lifted.
+        if self.maximum_sent.is_none() {
+            return;
+        }
+        let size = Vec2::new(size.x.round(), size.y.round() + CHILD_TITLE_HEIGHT).min(maximum_size(ctx));
         if self.fitted.is_none_or(|s| (s - size).length() > 1.0) {
             self.fitted = Some(size);
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));

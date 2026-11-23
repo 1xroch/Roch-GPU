@@ -30,7 +30,7 @@ pub enum MainAction {
     OpenXoc,
     OpenFan,
     ToggleMonitor,
-    OpenGraphics,
+    ToggleInfo,
     OpenLog,
     OpenSettings,
     Minimize,
@@ -129,14 +129,13 @@ fn header(ui: &mut Ui, vm: &MainViewModel, actions: &mut Vec<MainAction>) {
         ui.spacing_mut().item_spacing.y = 1.0;
         ui.horizontal_top(|ui| {
             let right_w = (80.0 + 80.0 + 64.0) * theme::text_factor() + 3.0 * 6.0;
-            // A picker is taller than the plain label; give the header row room for it.
-            let gpu_row_h = if vm.gpu_count() > 1 { 38.0 } else { 30.0 };
             ui.allocate_ui_with_layout(
-                vec2(ui.available_width() - right_w - 8.0, gpu_row_h),
+                vec2(ui.available_width() - right_w - 8.0, 0.0),
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.add_space(2.0);
+                    let name = RichText::new(vm.device_model_name()).font(theme::bold(BODY)).color(p.accent);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         // "GPU:" in the normal text colour, the card's name in the accent.
@@ -147,9 +146,7 @@ fn header(ui: &mut Ui, vm: &MainViewModel, actions: &mut Vec<MainAction>) {
                             ui.add_enabled_ui(!vm.busy(), |ui| {
                                 egui::ComboBox::from_id_salt("gpu_selector")
                                     .width(ui.available_width())
-                                    .selected_text(
-                                        RichText::new(vm.device_display_name()).font(theme::bold(BODY)).color(p.accent),
-                                    )
+                                    .selected_text(name)
                                     .show_ui(ui, |ui| {
                                         for i in 0..vm.gpu_count() {
                                             if ui.selectable_label(i == current, vm.gpu_choice_label(i)).clicked() {
@@ -164,14 +161,10 @@ fn header(ui: &mut Ui, vm: &MainViewModel, actions: &mut Vec<MainAction>) {
                                 actions.push(MainAction::SelectGpu(i));
                             }
                         } else {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(vm.device_display_name()).font(theme::bold(BODY)).color(p.accent),
-                                )
-                                .wrap(),
-                            );
+                            ui.add(egui::Label::new(name).wrap());
                         }
                     });
+                    widgets::info_line(ui, &vm.device_board_line());
                     widgets::info_line(ui, &vm.driver_line());
                 },
             );
@@ -186,8 +179,8 @@ fn header(ui: &mut Ui, vm: &MainViewModel, actions: &mut Vec<MainAction>) {
                 if b(ui, "Telemetry", 80.0).on_hover_text("Open the hardware monitor in its own window").clicked() {
                     actions.push(MainAction::ToggleMonitor);
                 }
-                if b(ui, "Graphics", 80.0).on_hover_text("Open static graphics-card and driver information").clicked() {
-                    actions.push(MainAction::OpenGraphics);
+                if b(ui, "Info", 80.0).on_hover_text("Show or hide GPU and driver information").clicked() {
+                    actions.push(MainAction::ToggleInfo);
                 }
             });
         });
@@ -429,7 +422,7 @@ fn profile_bar(ui: &mut Ui, vm: &mut MainViewModel, actions: &mut Vec<MainAction
                             !busy,
                             true,
                         )
-                        .on_hover_text("Press Save, then a number, to store the current settings in that slot")
+                        .on_hover_text("Press Save, then a slot number, to store the current fan and tuning settings")
                         .clicked()
                         {
                             vm.set_save_armed(!armed);

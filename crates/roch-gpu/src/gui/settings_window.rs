@@ -78,7 +78,7 @@ impl SettingsWindow {
             .builder("Roch GPU — Settings", vec2(640.0, 600.0), icon, Placement::CenterOwner, main)
             .with_min_inner_size(self.chrome.min_size(vec2(520.0, 420.0)));
         ctx.show_viewport_immediate(Self::id(), builder, |ui, _| {
-            let mut closed = self.chrome.frame(ui.ctx(), dark) || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let mut closed = self.chrome.frame(ui, dark) || ui.input(|i| i.key_pressed(egui::Key::Escape));
             let palette = theme::pal(ui.ctx());
             settings_style(ui, &palette);
             egui::Panel::bottom("gpu-settings-footer")

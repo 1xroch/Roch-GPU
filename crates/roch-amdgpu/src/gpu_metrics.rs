@@ -15,6 +15,7 @@ pub struct GpuMetrics {
     pub vr_gfx_c: Option<u16>,
     pub vr_soc_c: Option<u16>,
     pub vr_mem_c: Option<u16>,
+    pub video_activity_percent: Option<u16>,
     pub soc_clock_mhz: Option<u16>,
     pub vclk0_mhz: Option<u16>,
     pub dclk0_mhz: Option<u16>,
@@ -44,6 +45,7 @@ impl GpuMetrics {
             vr_gfx_c: u16_at(10),
             vr_soc_c: u16_at(12),
             vr_mem_c: u16_at(14),
+            video_activity_percent: u16_at(20),
             soc_clock_mhz: u16_at(56),
             vclk0_mhz: u16_at(60),
             dclk0_mhz: u16_at(62),
@@ -142,6 +144,7 @@ mod tests {
     fn a_real_sample_decodes() {
         let m = GpuMetrics::parse(&IDLE_7900XT).unwrap();
         assert_eq!((m.vr_gfx_c, m.vr_soc_c, m.vr_mem_c), (Some(47), Some(45), Some(45)));
+        assert_eq!(m.video_activity_percent, Some(0));
         assert_eq!(m.soc_clock_mhz, Some(600));
         assert_eq!((m.vclk0_mhz, m.dclk0_mhz, m.vclk1_mhz, m.dclk1_mhz), (Some(25), Some(25), Some(25), Some(25)));
         assert_eq!((m.pcie_link_width, m.pcie_link_speed), (Some(8), Some(160)));
@@ -166,9 +169,11 @@ mod tests {
     fn all_ones_is_no_reading() {
         let mut sample = IDLE_7900XT;
         sample[10..12].fill(0xff);
+        sample[20..22].fill(0xff);
         sample[112..120].fill(0xff);
         let m = GpuMetrics::parse(&sample).unwrap();
         assert_eq!(m.vr_gfx_c, None);
+        assert_eq!(m.video_activity_percent, None);
         assert_eq!(m.throttle, None);
     }
 

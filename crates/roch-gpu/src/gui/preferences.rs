@@ -437,6 +437,9 @@ impl Prefs {
                 }
             }
         }
+        if let Some(previous) = p.positions.remove("Roch GPU — Graphics") {
+            p.positions.entry(super::windows::info::InfoWindow::TITLE.into()).or_insert(previous);
+        }
         if let Some(saved) = map.get("panels").and_then(Value::as_array) {
             p.panels.clear();
             for item in saved {

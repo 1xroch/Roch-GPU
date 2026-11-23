@@ -104,18 +104,23 @@ fn two_cards_of_one_model_are_told_apart_by_maker_then_bus() {
     // Different makers: the maker is enough.
     let f = twin_fixture(["MSI", "ASUSTeK Computer"]);
     let mut model = vm(&f);
+    assert_eq!(model.device_model_name(), "Simulated RTX 4070 SUPER (12GB)");
+    assert_eq!(model.device_board_line(), "Board: MSI");
     assert_eq!(model.device_display_name(), "Simulated RTX 4070 SUPER (12GB) · MSI");
     assert_eq!(model.gpu_choice_label(1), "2  ·  Simulated RTX 4070 SUPER  ·  ASUSTeK Computer  (PCI bus 2, slot 0)");
     model.switch_gpu(1).unwrap();
     assert_eq!(model.device_display_name(), "Simulated RTX 4070 SUPER (12GB) · ASUSTeK Computer");
+    assert_eq!(model.device_board_line(), "Board: ASUSTeK Computer");
 
     // The same maker twice: the bus says which.
     let f = twin_fixture(["MSI", "MSI"]);
     assert_eq!(vm(&f).device_display_name(), "Simulated RTX 4070 SUPER (12GB) · MSI · bus 1");
+    assert_eq!(vm(&f).device_board_line(), "Board: MSI · bus 1");
 
     // No maker known: the bus alone.
     let f = twin_fixture(["", ""]);
     assert_eq!(vm(&f).device_display_name(), "Simulated RTX 4070 SUPER (12GB) · bus 1");
+    assert_eq!(vm(&f).device_board_line(), "PCIe address: bus 1");
 
     // Different models keep their plain names.
     assert_eq!(vm(&multi_fixture()).device_display_name(), "Simulated RTX 4070 SUPER (12GB)");
@@ -453,6 +458,8 @@ fn slots_save_load_and_clear() {
     assert!(vm.status_is_error && vm.status.starts_with("Slot 2 is empty"), "{}", vm.status);
 
     vm.set(Field::CoreOffset, 60);
+    vm.set_fan_mode_index(FanMode::Fixed.as_number());
+    vm.set_fixed_fan_settings(65, &[]);
     vm.set_save_armed(true);
     assert_eq!(vm.status, "Pick a slot (1-5) to store the current settings");
     vm.on_slot_clicked(2);
@@ -461,12 +468,17 @@ fn slots_save_load_and_clear() {
     let slot = vm.slots()[1].clone();
     assert!(slot.occupied && slot.is_active);
     assert!(slot.summary.contains("core +60 MHz"), "{}", slot.summary);
+    assert!(slot.summary.contains("fan 65%"), "{}", slot.summary);
     assert_eq!(vm.selected_profile(), Some("Slot 2"));
 
     vm.set(Field::CoreOffset, 0);
+    vm.set_fan_mode_index(FanMode::Auto.as_number());
     vm.on_slot_clicked(2);
     assert_eq!(vm.get(Field::CoreOffset), 60, "clicking a slot loads it");
     vm.run_jobs_inline();
+    let state = f.shared.service.read_tuning_state().unwrap();
+    assert!(state.fan_manual);
+    assert_eq!(state.fan_percent, 65);
     assert!(vm.status.starts_with("Slot 2 applied at "), "{}", vm.status);
     assert_eq!(f.shared.settings().last_profile_by_gpu.get(&vm.device.name).map(String::as_str), Some("Slot 2"));
 
@@ -477,6 +489,39 @@ fn slots_save_load_and_clear() {
     vm.clear_slot(2);
     assert_eq!(vm.status, "Slot 2 cleared");
     assert!(!vm.slots()[1].occupied && !vm.slots()[1].is_active);
+}
+
+#[test]
+fn saving_profile_captures_unapplied_fan_and_overclock_edits() {
+    let f = fixture();
+    let mut draft = vm(&f);
+    draft.set(Field::CoreOffset, 120);
+    draft.set(Field::MemoryOffset, 400);
+    draft.set(Field::PowerLimit, 95);
+    draft.set_zero_rpm(false);
+    draft.set_fan_mode_index(FanMode::Curve.as_number());
+    draft.set_fixed_fan_settings(65, &[65, 70, 80]);
+    let mut curve = FanCurve::with_points(vec![FanPoint::new(35.0, 30.0), FanPoint::new(80.0, 85.0)]);
+    curve.hysteresis_c = 4.0;
+    curve.minimum_step_percent = 3.0;
+    *draft.editor_curve_mut() = curve.clone_config();
+    draft.mark_curve_dirty();
+
+    draft.set_save_armed(true);
+    draft.on_slot_clicked(4);
+    assert!(!draft.busy(), "saving does not apply hardware settings");
+    assert_eq!(f.shared.service.read_tuning_state().unwrap().core_offset_mhz, 0);
+
+    let mut reopened = vm(&f);
+    reopened.set_selected_profile(Some("Slot 4".into()));
+    reopened.load_selected_profile();
+    let restored = reopened.build_profile_from_editor("Slot 4");
+    assert_eq!((restored.core_offset_mhz, restored.memory_offset_mhz, restored.power_limit_percent), (120, 400, 95));
+    assert_eq!(restored.fan_mode, FanMode::Curve);
+    assert_eq!(restored.fixed_fan_percent, 65);
+    assert_eq!(restored.fixed_fan_percents, [65, 70, 80]);
+    assert_eq!(restored.fan_curve, curve);
+    assert!(!restored.zero_rpm);
 }
 
 #[test]

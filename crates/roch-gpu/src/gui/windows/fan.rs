@@ -42,12 +42,7 @@ type StatusSlot = Arc<Mutex<Option<(String, bool)>>>;
 #[derive(Default)]
 pub struct FanWindow {
     chrome: ChildChrome,
-    loaded: bool,
-    /// 0 Auto, 1 Fixed, 2 Curve — local until Apply, as the WPF radio buttons were.
-    mode: i32,
-    sliders: Vec<i32>,
-    slider_range: (i32, i32),
-    link: bool,
+    curve_revision: Option<u64>,
     readouts: Vec<String>,
     editor: FanEditor,
     hysteresis: String,
@@ -79,32 +74,25 @@ impl FanWindow {
         }
     }
 
-    /// Seed everything from the view model the first time the window is drawn.
-    fn load(&mut self, vm: &MainViewModel) {
-        let caps = &vm.caps;
-        let count = caps.fan_count.max(1) as usize;
-        let max = if caps.fan_max_percent <= 0 { 100 } else { caps.fan_max_percent };
-        self.slider_range = (caps.fan_min_percent, max.max(caps.fan_min_percent));
-        self.sliders = (0..count)
-            .map(|i| {
-                let v = vm.per_fan_percents().get(i).copied().unwrap_or_else(|| vm.get(Field::FixedFan));
-                v.clamp(self.slider_range.0, self.slider_range.1)
-            })
-            .collect();
-        self.readouts = vec!["—".into(); count];
-        self.link = true;
-        self.editor.set_points(&vm.editor_curve().points);
-        self.editor.set_max_points(hardware_point_limit(caps));
-        self.hysteresis = one_decimal(vm.editor_curve().hysteresis_c);
-        self.min_step = one_decimal(vm.editor_curve().minimum_step_percent);
-        self.mode = vm.fan_mode_index().clamp(0, 2);
-        self.loaded = true;
+    /// Reload the plot and its text boxes when a profile or reset replaces the draft curve.
+    fn refresh(&mut self, vm: &MainViewModel) {
+        self.readouts.resize_with(vm.caps.fan_count.max(1) as usize, || "—".into());
+        let revision = vm.fan_curve_revision();
+        if self.curve_revision == Some(revision) {
+            return;
+        }
+        let curve = vm.editor_curve();
+        self.editor.set_points(&curve.points);
+        self.editor.set_max_points(hardware_point_limit(&vm.caps));
+        self.hysteresis = one_decimal(curve.hysteresis_c);
+        self.min_step = one_decimal(curve.minimum_step_percent);
+        self.point_rows.clear();
+        self.last_press = None;
+        self.curve_revision = Some(revision);
     }
 
     pub fn show(&mut self, ctx: &Context, w: &mut WinCtx) -> bool {
-        if !self.loaded {
-            self.load(w.vm);
-        }
+        self.refresh(w.vm);
         if let Some((text, err)) = self.posted.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.status = text;
             self.status_error = err;
@@ -114,11 +102,15 @@ impl FanWindow {
             .builder("Fan Control", vec2(WIDTH, 697.0), w.icon, Placement::CenterOwner, w.main_rect)
             .with_min_inner_size(self.chrome.min_size(vec2(460.0, 200.0)));
         ctx.show_viewport_immediate(Self::id(), builder, |ui, _class: ViewportClass| {
-            let closed = self.chrome.frame(ui.ctx(), w.dark);
+            let closed = self.chrome.frame(ui, w.dark);
             let width = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.width())).unwrap_or(WIDTH);
             let resp = content_frame(ui.ctx(), 12).show(ui, |ui| {
                 ui.set_width(width - 24.0);
-                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| self.body(ui, w)).content_size.y
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| ui.add_enabled_ui(!w.vm.busy(), |ui| self.body(ui, w)))
+                    .content_size
+                    .y
             });
             // SizeToContent="Height".
             self.chrome.fit(ui.ctx(), vec2(width, resp.inner + 24.0));
@@ -145,20 +137,18 @@ impl FanWindow {
                 .into_iter()
                 .enumerate()
                 {
-                    if widgets::radio(ui, self.mode == i as i32, name, true).on_hover_text(tip).clicked() {
-                        self.mode = i as i32;
+                    if widgets::radio(ui, w.vm.fan_mode_index() == i as i32, name, true).on_hover_text(tip).clicked() {
+                        w.vm.set_fan_mode_index(i as i32);
                     }
                 }
             });
             ui.add_space(7.0);
-            wrapped(ui, &mode_note(self.mode, &caps, w.vm.has_zero_rpm()), p.text);
+            wrapped(ui, &mode_note(w.vm.fan_mode_index(), &caps, w.vm.has_zero_rpm()), p.text);
             if w.vm.has_zero_rpm() {
                 ui.add_space(12.0);
                 let mut z = w.vm.zero_rpm();
                 if widgets::checkbox(ui, &mut z, "Zero RPM (fans stop at idle)", true)
-                    .on_hover_text(
-                        "Allow idle fan stop where supported by the driver and selected fan mode. Press Apply to save.",
-                    )
+                    .on_hover_text("Allow idle fan stop. Apply to use it now, or save it in a profile.")
                     .changed()
                 {
                     w.vm.set_zero_rpm(z);
@@ -167,12 +157,12 @@ impl FanWindow {
         });
         ui.add_space(8.0);
 
-        match self.mode {
-            1 => panel(ui, 12, 10, |ui| self.fixed_panel(ui)),
+        match w.vm.fan_mode_index() {
+            1 => panel(ui, 12, 10, |ui| self.fixed_panel(ui, w.vm)),
             2 => panel(ui, 12, 10, |ui| self.curve_panel(ui, w.vm, &caps)),
             _ => {}
         }
-        if self.mode != 0 {
+        if w.vm.fan_mode_index() != 0 {
             ui.add_space(8.0);
         }
 
@@ -199,24 +189,29 @@ impl FanWindow {
         });
     }
 
-    fn fixed_panel(&mut self, ui: &mut Ui) {
+    fn fixed_panel(&self, ui: &mut Ui, vm: &mut MainViewModel) {
         let p = pal(ui.ctx());
+        let count = self.readouts.len();
+        let (min, max) = vm.bounds(Field::FixedFan);
+        let (mut linked, mut sliders) = fixed_duties(vm, count);
+        let mut changed = false;
         ui.horizontal(|ui| {
             section_title(ui, "FIXED SPEED");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let mut link = self.link;
-                if widgets::checkbox(ui, &mut link, "Move together", true)
-                    .on_hover_text("One slider drives them all. Untick to set each fan on its own.")
-                    .clicked()
-                {
-                    self.link = link;
-                    if link && let Some(&first) = self.sliders.first() {
-                        self.sliders.iter_mut().for_each(|s| *s = first);
+            if count > 1 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::checkbox(ui, &mut linked, "Move together", true)
+                        .on_hover_text("One slider drives them all. Untick to set each fan on its own.")
+                        .changed()
+                    {
+                        changed = true;
+                        if linked {
+                            let first = sliders[0];
+                            sliders.fill(first);
+                        }
                     }
-                }
-            });
+                });
+            }
         });
-        let count = self.sliders.len();
         ui.add_space(2.0);
         wrapped(ui, &fixed_note(count), p.text);
         ui.add_space(6.0);
@@ -233,28 +228,31 @@ impl FanWindow {
             ui.add_space(1.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let (min, max) = self.slider_range;
-                let mut v = self.sliders[i];
+                let mut v = sliders[i];
                 let mut moved = false;
                 if widgets::nudge_button(ui, "\u{25C0}", true) {
                     v = (v - STEP).clamp(min, max);
                     moved = true;
                 }
                 let sw = (ui.available_width() - 18.0 - 4.0).max(20.0);
-                moved |= widgets::value_slider(ui, &mut v, self.slider_range, STEP, sw, true);
+                moved |= widgets::value_slider(ui, &mut v, (min, max), STEP, sw, true);
                 if widgets::nudge_button(ui, "\u{25B6}", true) {
                     v = (v + STEP).clamp(min, max);
                     moved = true;
                 }
                 if moved {
                     // Linked sliders move as one; unlinked, each is its own fan.
-                    if self.link {
-                        self.sliders.iter_mut().for_each(|s| *s = v);
+                    changed = true;
+                    if linked {
+                        sliders.fill(v);
                     } else {
-                        self.sliders[i] = v;
+                        sliders[i] = v;
                     }
                 }
             });
+        }
+        if changed {
+            vm.set_fixed_fan_settings(sliders[0], if linked { &[] } else { &sliders });
         }
         ui.add_space(15.0);
     }
@@ -433,7 +431,7 @@ impl FanWindow {
                 let e = self.editor.press(&g, x, y, double);
                 edit.curve |= e.curve;
                 edit.selection |= e.selection;
-            } else if down && moving && self.editor.dragging().is_some() {
+            } else if ui.is_enabled() && down && moving && self.editor.dragging().is_some() {
                 let (x, y) = local(at);
                 let e = self.editor.drag_to(&g, x, y);
                 edit.curve |= e.curve;
@@ -443,7 +441,7 @@ impl FanWindow {
                 edit.curve |= self.editor.remove_at(&g, x, y).curve;
             }
         }
-        if released || !down {
+        if released || !down || !ui.is_enabled() {
             self.editor.release();
         }
         if resp.hovered() {
@@ -457,13 +455,9 @@ impl FanWindow {
     /// Apply: write the mode, duties, curve and Zero RPM on the worker, then sync the main
     /// window's controls and the active slot.
     fn apply(&mut self, vm: &mut MainViewModel) {
-        let mode = match self.mode {
-            2 => FanMode::Curve,
-            1 => FanMode::Fixed,
-            _ => FanMode::Auto,
-        };
-        let duties: Vec<i32> = if self.link || self.sliders.len() < 2 { Vec::new() } else { self.sliders.clone() };
-        let percent = self.sliders.first().copied().unwrap_or(50);
+        let mode = FanMode::from_number(i64::from(vm.fan_mode_index())).unwrap_or(FanMode::Auto);
+        let duties = vm.per_fan_percents().to_vec();
+        let percent = vm.get(Field::FixedFan);
         let curve = vm.editor_curve().clone_config();
         let zero = vm.has_zero_rpm().then(|| vm.zero_rpm());
         let hardware = vm.caps.fan_curve_is_hardware;
@@ -494,12 +488,26 @@ fn hardware_point_limit(caps: &GpuCapabilities) -> Option<usize> {
     (caps.fan_curve_is_hardware && caps.fan_curve_points >= 2).then_some(caps.fan_curve_points as usize)
 }
 
+fn fixed_duties(vm: &MainViewModel, count: usize) -> (bool, Vec<i32>) {
+    let (min, max) = vm.bounds(Field::FixedFan);
+    let percent = vm.get(Field::FixedFan);
+    let per_fan = vm.per_fan_percents();
+    let linked = per_fan.len() < 2;
+    let duties = (0..count)
+        .map(|i| {
+            let duty = if linked { percent } else { per_fan.get(i).copied().unwrap_or(percent) };
+            duty.clamp(min, max)
+        })
+        .collect();
+    (linked, duties)
+}
+
 /// The line under FIXED SPEED.
 fn fixed_note(count: usize) -> String {
     if count > 1 {
         format!("This card reports {count} fans, each addressed separately by the driver.")
     } else {
-        "This card reports one fan.".into()
+        "The driver exposes one shared fan speed control for this GPU.".into()
     }
 }
 
@@ -520,21 +528,23 @@ fn point_hint(n: usize) -> String {
 #[cfg(test)]
 pub(crate) fn audit_initial(vm: &MainViewModel, sample: &GpuTelemetry) -> Vec<(String, String)> {
     let mut w = FanWindow::default();
-    w.load(vm);
+    w.refresh(vm);
     let caps = &vm.caps;
-    let count = w.sliders.len();
+    let count = w.readouts.len();
+    let (min, max) = vm.bounds(Field::FixedFan);
+    let (linked, duties) = fixed_duties(vm, count);
     let mut out = Vec::new();
     let mut put = |k: String, v: String| out.push((format!("fanwin.{k}"), v));
     put("fixed_note".into(), fixed_note(count));
-    put("slider.min".into(), w.slider_range.0.to_string());
-    put("slider.max".into(), w.slider_range.1.to_string());
+    put("slider.min".into(), min.to_string());
+    put("slider.max".into(), max.to_string());
     put("slider.step".into(), STEP.to_string());
-    for i in 0..count {
+    for (i, duty) in duties.iter().enumerate() {
         put(format!("fan.{i}.label"), fan_label(i, count));
-        put(format!("fan.{i}.value"), w.sliders[i].to_string());
+        put(format!("fan.{i}.value"), duty.to_string());
         put(format!("fan.{i}.readout"), w.readouts[i].clone());
     }
-    put("link".into(), w.link.to_string());
+    put("link".into(), linked.to_string());
     put("software_curve_parameters_visible".into(), (!caps.fan_curve_is_hardware).to_string());
     put("hysteresis".into(), w.hysteresis.clone());
     put("min_step".into(), w.min_step.clone());
@@ -546,7 +556,7 @@ pub(crate) fn audit_initial(vm: &MainViewModel, sample: &GpuTelemetry) -> Vec<(S
         );
     }
     put("point_hint".into(), point_hint(pts.len()));
-    put("mode".into(), w.mode.to_string());
+    put("mode".into(), vm.fan_mode_index().to_string());
     for m in 0..3 {
         put(format!("mode_note.{m}"), mode_note(m, caps, vm.has_zero_rpm()));
     }

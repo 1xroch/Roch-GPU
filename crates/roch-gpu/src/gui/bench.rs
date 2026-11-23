@@ -14,7 +14,7 @@ pub enum Win {
     Curve,
     Xoc,
     Fan,
-    Graphics,
+    Info,
 }
 
 /// What the app should do for the current step.
@@ -40,8 +40,8 @@ const SCRIPT: &[(Option<Step>, u64, bool)] = &[
     (Some(Step::Close(Win::Xoc)), 1000, false),
     (Some(Step::Open(Win::Fan)), 1500, false),
     (Some(Step::Close(Win::Fan)), 1000, false),
-    (Some(Step::Open(Win::Graphics)), 1500, false),
-    (Some(Step::Close(Win::Graphics)), 1000, false),
+    (Some(Step::Open(Win::Info)), 1500, false),
+    (Some(Step::Close(Win::Info)), 1000, false),
     (Some(Step::Exit), 0, false),
 ];
 

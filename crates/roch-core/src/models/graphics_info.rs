@@ -1,8 +1,8 @@
-//! Static graphics-card identity shown by the read-only Graphics window.
+//! Static graphics-card identity shown by the Info window.
 
 use super::gpu::GpuDevice;
 
-/// One read-only row in the Graphics window.
+/// One read-only row in the Info window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuGraphicsRow {
     pub name: String,
@@ -46,6 +46,7 @@ impl GpuGraphicsInfo {
     pub fn from_device(device: &GpuDevice) -> Self {
         Self {
             gpu: device.name.clone(),
+            board_manufacturer: device.board_vendor.clone(),
             bios_version: device.bios_version.clone(),
             bus_address: device.bus_id.clone(),
             memory_size: if device.vram_megabytes > 0 {
@@ -71,7 +72,7 @@ impl GpuGraphicsInfo {
             ("ROPs / TMUs", &self.rops_tmus),
             ("Base / Boost Clock", &self.clocks),
             ("Pixel / Texture Fill", &self.fill_rate),
-            ("TDP", &self.tdp),
+            ("Default Power Limit", &self.tdp),
             ("GPU Technology", &self.technology),
             ("Memory Size", &self.memory_size),
             ("Memory Type", &self.memory_type),

@@ -21,7 +21,7 @@ pub enum ButtonKind {
     Primary,
     /// Reset to Defaults: danger-coloured border.
     Danger,
-    /// The small header buttons (Graphics, Telemetry, Log): square corners.
+    /// The small header buttons (Info, Telemetry, Log): square corners.
     Header,
     /// A numbered profile slot.
     Slot { occupied: bool, active: bool },

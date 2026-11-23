@@ -48,6 +48,7 @@ const NEAR_THERMAL_LIMIT_C: f64 = 20.0;
 /// How much of its cap the board must be drawing before a power throttling bit is believed. Well under
 /// the cap, because the reading is an average and the limit acts on short spikes too.
 const NEAR_POWER_LIMIT: f64 = 0.75;
+const BYTES_PER_MIB: f64 = (1024 * 1024) as f64;
 
 /// One card, as found at start-up.
 struct Card {
@@ -359,6 +360,11 @@ impl AmdgpuBackend {
         Some((value? != 0, range.is_some()))
     }
 
+    fn write_zero_rpm(&mut self, path: &Path, enabled: bool) -> Result<()> {
+        self.write(path, if enabled { "1\n" } else { "0\n" })?;
+        self.write(path, "c\n")
+    }
+
     /// `ip_discovery` exists from Navi 1x on, so a card without it is an older one.
     fn graphics_core_major(&self, gpu: usize) -> Option<u32> {
         read_text(&self.card(gpu).ok()?.attr("ip_discovery/die/0/GC/0/major"))?.parse().ok()
@@ -568,10 +574,16 @@ impl GpuBackend for AmdgpuBackend {
         let (Ok(card), Some(device)) = (self.card(gpu), self.devices.get(gpu)) else {
             return GpuGraphicsInfo::default();
         };
+        let vendor = read_hex(&card.attr("vendor")).unwrap_or(0);
+        let pci_id = if vendor != 0 && card.device_id != 0 { vendor | (card.device_id << 16) } else { 0 };
+        let subsystem = read_hex(&card.attr("subsystem_device"))
+            .filter(|_| card.subsystem_vendor != 0)
+            .map_or(0, |id| card.subsystem_vendor | (id << 16));
         let base = GpuGraphicsInfo {
-            board_manufacturer: GpuIdentity::board_vendor(card.subsystem_vendor as i32),
             code_name: card.code_name.clone(),
             revision: format!("{:02X}", card.revision),
+            device_id: GpuIdentity::device_id_text(pci_id, subsystem),
+            memory_type: identity::memory_type_of(&card.code_name).to_string(),
             ..GpuGraphicsInfo::from_device(device)
         };
         if !self.is_awake(gpu) {
@@ -581,8 +593,8 @@ impl GpuBackend for AmdgpuBackend {
         let metrics = self.read_metrics(card).unwrap_or_default();
         let (generation, lanes) = pcie_link(&card.dir);
         GpuGraphicsInfo {
-            memory_type: identity::memory_type_of(&base.code_name).to_string(),
             memory_vendor: read_text(&card.attr("mem_info_vram_vendor")).map(|v| capitalized(&v)).unwrap_or_default(),
+            tdp: GpuIdentity::watts_text(card.hw_scaled("power1_cap_default", 1e6)),
             bus_interface: GpuIdentity::pcie_bus_interface(
                 generation,
                 lanes,
@@ -724,7 +736,7 @@ impl GpuBackend for AmdgpuBackend {
         }
         let card = self.card(gpu)?;
 
-        let (mut edge, mut junction, mut memory) = (nan, nan, nan);
+        let (mut edge, mut junction, mut memory, mut junction_limit) = (nan, nan, nan, nan);
         // No limit readable means no way to judge, and then the firmware's word stands.
         let (mut near_a_limit, mut limits_known) = (false, false);
         for i in 1..=8 {
@@ -735,7 +747,10 @@ impl GpuBackend for AmdgpuBackend {
             near_a_limit |= value >= limit - NEAR_THERMAL_LIMIT_C;
             match label.as_str() {
                 "edge" => edge = value,
-                "junction" => junction = value,
+                "junction" => {
+                    junction = value;
+                    junction_limit = limit;
+                }
                 "mem" => memory = value,
                 _ => {}
             }
@@ -743,6 +758,8 @@ impl GpuBackend for AmdgpuBackend {
         if edge.is_nan() {
             edge = card.hw_scaled("temp1_input", 1000.0);
         }
+        let junction = believable(junction, "°C");
+        let junction_limit = believable(junction_limit, "°C");
 
         let watts = {
             let average = card.hw_scaled("power1_average", 1e6);
@@ -753,6 +770,12 @@ impl GpuBackend for AmdgpuBackend {
         let duty = card.hw_scaled("pwm1", 255.0 / 100.0);
         let rpm = card.hw_scaled("fan1_input", 1.0);
         let dpm_clock = |file: &str| read_text(&card.attr(file)).and_then(|t| od::current_level_mhz(&t));
+        let vram_used = read_i64(&card.attr("mem_info_vram_used"));
+        let gtt_used = read_i64(&card.attr("mem_info_gtt_used"));
+        let memory_usage = |used: Option<i64>, total: &str| {
+            let capacity = read_i64(&card.attr(total)).filter(|&bytes| bytes > 0)?;
+            Some(100.0 * used? as f64 / capacity as f64)
+        };
 
         let metrics = self.read_metrics(card);
         let m = metrics.clone().unwrap_or_default();
@@ -766,21 +789,25 @@ impl GpuBackend for AmdgpuBackend {
         sensor("vr_gfx", "Core VRM", "°C", from(m.vr_gfx_c));
         sensor("vr_mem", "Memory VRM", "°C", from(m.vr_mem_c));
         sensor("vr_soc", "SoC VRM", "°C", from(m.vr_soc_c));
+        sensor(
+            "hotspot_headroom",
+            "Hot spot headroom",
+            "°C",
+            (junction.is_finite() && junction_limit > 0.0).then(|| (junction_limit - junction).max(0.0)),
+        );
         sensor("v_soc", "SoC voltage", "mV", from(m.voltage_soc_mv));
         sensor("v_mem", "Memory voltage", "mV", from(m.voltage_mem_mv));
         sensor("vclk0", "VCN clock 1", "MHz", from(m.vclk0_mhz));
         sensor("dclk0", "VCN decode clock 1", "MHz", from(m.dclk0_mhz));
         sensor("vclk1", "VCN clock 2", "MHz", from(m.vclk1_mhz));
         sensor("dclk1", "VCN decode clock 2", "MHz", from(m.dclk1_mhz));
+        sensor("video_load", "Video engine", "%", from(m.video_activity_percent));
         sensor("power_cap", "dGPU power limit", "W", Some(cap_watts));
         sensor("pcie_gen", "PCIe link generation", "gen", m.pcie_generation().map(f64::from));
         sensor("pcie_width", "PCIe link width", "lanes", from(m.pcie_link_width));
-        sensor(
-            "gtt",
-            "Shared GPU memory used",
-            "MB",
-            read_i64(&card.attr("mem_info_gtt_used")).map(|b| b as f64 / (1024.0 * 1024.0)),
-        );
+        sensor("gtt", "Shared GPU memory used", "MB", gtt_used.map(|b| b as f64 / BYTES_PER_MIB));
+        sensor("vram_usage", "Dedicated VRAM occupancy", "%", memory_usage(vram_used, "mem_info_vram_total"));
+        sensor("gtt_usage", "Shared GPU memory occupancy", "%", memory_usage(gtt_used, "mem_info_gtt_total"));
 
         Ok(GpuTelemetry {
             core_clock_mhz: believable(card.hw_scaled("freq1_input", 1e6), "MHz"),
@@ -792,7 +819,7 @@ impl GpuBackend for AmdgpuBackend {
                 .or_else(|| dpm_clock("pp_dpm_socclk").map(f64::from))
                 .unwrap_or(nan),
             temperature_c: believable(edge, "°C"),
-            hot_spot_c: believable(junction, "°C"),
+            hot_spot_c: junction,
             memory_temperature_c: believable(memory, "°C"),
             voltage_mv: believable(card.hw_scaled("in0_input", 1.0), "mV"),
             power_watts: believable(watts, "W"),
@@ -800,7 +827,7 @@ impl GpuBackend for AmdgpuBackend {
             power_percent: if default_watts > 0.0 { believable(watts, "W") / default_watts * 100.0 } else { nan },
             gpu_load_percent: read_i64(&card.attr("gpu_busy_percent")).map_or(nan, |v| believable(v as f64, "%")),
             memory_load_percent: read_i64(&card.attr("mem_busy_percent")).map_or(nan, |v| believable(v as f64, "%")),
-            memory_used_mb: read_i64(&card.attr("mem_info_vram_used")).map_or(nan, |b| b as f64 / (1024.0 * 1024.0)),
+            memory_used_mb: vram_used.map_or(nan, |b| b as f64 / BYTES_PER_MIB),
             fan_percent: believable(duty, "%"),
             fan_rpm: believable(rpm, "RPM"),
             fan_percents: vec![believable(duty, "%")],
@@ -982,12 +1009,21 @@ impl GpuBackend for AmdgpuBackend {
         let Some((on, true)) = self.read_zero_rpm(gpu) else {
             bail!("This card does not expose zero RPM control.");
         };
-        if on == enabled {
+        let card = self.card(gpu)?;
+        let needs_refresh = !on && !enabled && card.hw_i64("fan1_input") == Some(0);
+        if on == enabled && !needs_refresh {
             return Ok(());
         }
-        let path = self.card(gpu)?.attr(ZERO_RPM_FILE);
-        self.write(&path, if enabled { "1\n" } else { "0\n" })?;
-        self.write(&path, "c\n")
+        let path = card.attr(ZERO_RPM_FILE);
+        // The driver can cache "off" while the firmware still stops the fans. The driver skips
+        // an unchanged commit, so briefly re-arm the switch to make the next commit reach it.
+        let refresh = if needs_refresh { self.write_zero_rpm(&path, true) } else { Ok(()) };
+        self.write_zero_rpm(&path, enabled)?;
+        refresh?;
+        if self.read_zero_rpm(gpu).map(|(on, _)| on) != Some(enabled) {
+            bail!("The driver did not confirm the Zero RPM setting.");
+        }
+        Ok(())
     }
 
     /// One duty. On the firmware's curve that is the same duty at every point. As on Windows, zero RPM is
