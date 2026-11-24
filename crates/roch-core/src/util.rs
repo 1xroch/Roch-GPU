@@ -107,6 +107,41 @@ pub fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
     if lo > hi { lo } else { v.clamp(lo, hi) }
 }
 
+/// When the operating system last started, in Unix seconds: now minus the uptime, so two readings
+/// of one boot can differ by a second or so (compare with [`same_boot`]). `None` where the uptime
+/// cannot be read. Windows' Fast Startup resumes a hibernated kernel, so its uptime carries on
+/// across that kind of shutdown.
+pub fn boot_time_unix_s() -> Option<i64> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(now - uptime_s()?)
+}
+
+/// True when two [`boot_time_unix_s`] readings name the same boot.
+pub fn same_boot(a: i64, b: i64) -> bool {
+    a > 0 && b > 0 && (a - b).abs() <= 120
+}
+
+#[cfg(windows)]
+fn uptime_s() -> Option<i64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    // SAFETY: no arguments and no preconditions; available on every supported Windows.
+    Some((unsafe { GetTickCount64() } / 1000) as i64)
+}
+
+#[cfg(target_os = "linux")]
+fn uptime_s() -> Option<i64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    text.split_whitespace().next()?.parse::<f64>().ok().map(|s| s as i64)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn uptime_s() -> Option<i64> {
+    None
+}
+
 /// `Math.Clamp` for doubles that never panics (NaN passes through, as in .NET).
 #[inline]
 pub fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 {

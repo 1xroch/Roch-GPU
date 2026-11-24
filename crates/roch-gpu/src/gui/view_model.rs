@@ -15,6 +15,8 @@
 #![allow(dead_code)]
 
 use roch_core::models::{clock_step, ocp_bounds};
+use roch_core::services::LeversOnCard;
+use roch_core::util::boot_time_unix_s;
 use roch_core::{
     FanCurve, FanMode, GpuCapabilities, GpuDevice, GpuGraphicsInfo, GpuTelemetry, GpuTuningState, Result,
     TuningProfile, VoltageControlStyle, XocLever, only_notes,
@@ -412,6 +414,23 @@ impl MainViewModel {
             }
         }
 
+        // Gated levers an earlier run left on the card: a memory clock lock outlives the app, and
+        // the card cannot report it. Take them over, so the XOC window shows them live and Disable
+        // releases them. A record that cannot be checked against the card is left for next time.
+        let on_record = shared.settings().levers_on_card_by_gpu.get(&name).cloned();
+        let mut record_unchecked = false;
+        if svc.applied_profile().is_none()
+            && let Some(rec) = &on_record
+        {
+            match svc.read_tuning_state() {
+                Ok(live) => {
+                    let adopted = svc.adopt_levers_on_card(rec.still_on_card(&live, boot_time_unix_s()));
+                    vm.show_levers_on_card(adopted, rec);
+                }
+                Err(_) => record_unchecked = true,
+            }
+        }
+
         // ...except the fans, which the card cannot describe: the driver knows only "auto" or
         // "manual at N%" and stores no curve. The saved profile is the only thing that knows, so
         // the fan half comes from the last slot applied on this card, or the logon profile.
@@ -431,7 +450,7 @@ impl MainViewModel {
                 vm.set(Field::FixedFan, f.percent);
                 vm.per_fan_percents = f.per_fan;
                 vm.editor_curve = f.curve;
-            } else if let Some(saw) = fan_source
+            } else if let Some(saw) = &fan_source
                 && saw.gpu_name.as_deref().is_none_or(|g| g.is_empty() || g == name)
             {
                 vm.set_fan_mode_index(saw.fan_mode.as_number());
@@ -440,7 +459,29 @@ impl MainViewModel {
                 vm.editor_curve = saw.fan_curve.clone_config();
             }
         }
+        // The software temperature limit is the same: it lives in this app, never on the card, so
+        // until this run applies something the card reads as "off" (its own limit, 88 °C on a
+        // 5070 Ti). Show the last slot's value instead of falling back to that default.
+        let restored_soft = (vm.has_soft_temp_limit() && svc.applied_profile().is_none())
+            .then_some(fan_source.as_ref())
+            .flatten()
+            .filter(|p| p.gpu_name.as_deref().is_none_or(|g| g.is_empty() || g == name))
+            .map(|p| p.soft_thermal_limit_c)
+            .filter(|&c| c > 0 && c <= vm.caps.soft_thermal_limit_range().1);
+        if let Some(c) = restored_soft {
+            vm.set(Field::SoftTempLimit, c);
+        }
         vm.mark_clean();
+        // A limit below the card's own is one this app enforces, and nothing enforces it until it
+        // is applied: say so rather than imply it is running.
+        if restored_soft.is_some() && vm.soft_temp_limit_c() > 0 && vm.soft_temp_limit_c() < vm.soft_temp_off_c() {
+            vm.dirty();
+        }
+        // Brings the record up to date: drops levers that are gone, and covers a logon apply that
+        // ran before this window existed.
+        if !record_unchecked {
+            vm.remember_levers_on_card();
+        }
 
         vm.refresh_profiles();
         vm.refresh_slots();
@@ -1730,7 +1771,7 @@ impl MainViewModel {
                 if rb.lock_mv > 0 {
                     let how = self.shared.service.voltage_lock_mechanism();
                     let via =
-                        if matches!(how.as_str(), "none" | "n/a" | "") { String::new() } else { format!(" ({how})") };
+                        if matches!(how.as_str(), "none" | "n/a" | "") { String::new() } else { format!(" via {how}") };
                     format!("{} mV{via}", rb.lock_mv)
                 } else if a.voltage_boost_percent > 0 {
                     format!("boost +{}%", a.voltage_boost_percent)
@@ -1774,7 +1815,7 @@ impl MainViewModel {
             "auto".into()
         };
         format!(
-            "On GPU: volt {volts} · core {} · mem {mem} · power {}%{temp} · fan {fan}{extras}",
+            "On GPU: voltage {volts} · core {} · mem {mem} · power {}%{temp} · fan {fan}{extras}",
             if self.has_core_min_clock() {
                 format!("{}–{}", a.core_min_clock_mhz, a.core_offset_mhz)
             } else {
@@ -2171,6 +2212,62 @@ impl MainViewModel {
         self.loading_editor = false;
     }
 
+    /// Show levers taken over from an earlier run as armed, with the values that run wrote.
+    fn show_levers_on_card(&mut self, levers: XocLever, rec: &LeversOnCard) {
+        if levers.is_empty() {
+            return;
+        }
+        let mut p = self.build_profile_from_editor(&self.device.name.clone());
+        rec.fill(levers, &mut p);
+        let c = self.caps.clone();
+        let pick = |v: i32, fallback: i32| if v > 0 { v } else { fallback };
+        self.loading_editor = true;
+        if levers.has(XocLever::NVVDD) {
+            self.set(Field::VoltageRailMax, pick(p.voltage_rail_max_mv, self.stock_nvvdd_max_mv()));
+            self.set(Field::VoltageRailFloor, pick(p.voltage_rail_floor_mv, c.voltage_rail_stock_floor_mv));
+        }
+        if levers.has(XocLever::MSVDD) {
+            self.set(Field::MsvddRailMax, pick(p.msvdd_rail_max_mv, self.stock_msvdd_max_mv()));
+            self.set(Field::MsvddRailFloor, pick(p.msvdd_rail_floor_mv, c.msvdd_rail_stock_floor_mv));
+        }
+        if levers.has(XocLever::NVVDD_OCP) {
+            self.set(Field::NvvddOcpAmps, pick(p.nvvdd_ocp_milliamps, c.nvvdd_ocp_stock_milliamps) / 1000);
+        }
+        if levers.has(XocLever::MSVDD_OCP) {
+            self.set(Field::MsvddOcpAmps, pick(p.msvdd_ocp_milliamps, c.msvdd_ocp_stock_milliamps) / 1000);
+        }
+        if levers.has(XocLever::CLOCK_RANGE) {
+            self.set(Field::ClockLockMin, pick(p.clock_lock_min_mhz, c.clock_lock_min_mhz));
+            self.set(Field::ClockLockMax, pick(p.clock_lock_max_mhz, c.clock_lock_max_mhz));
+        }
+        if levers.has(XocLever::MEMORY_CLOCK) {
+            self.set(Field::MemoryLockMin, pick(p.memory_clock_lock_min_mhz, c.memory_lock_min_mhz));
+            self.set(Field::MemoryLockMax, pick(p.memory_clock_lock_max_mhz, c.memory_lock_max_mhz));
+        }
+        self.loading_editor = false;
+        self.xoc_armed = XocLever(self.xoc_armed.0 | (levers.0 & !self.main_clock_levers().0));
+    }
+
+    /// Record which gated levers are on the card now, with their values, for the next run (see
+    /// `LeversOnCard`). Called after every driver job that can move a lever.
+    fn remember_levers_on_card(&mut self) {
+        let levers = XocLever(self.shared.service.armed_on_card().0 & !self.main_clock_levers().0);
+        let name = self.device.name.clone();
+        let record = (!levers.is_empty()).then(|| {
+            LeversOnCard::new(levers, &self.build_profile_from_editor(&name), boot_time_unix_s().unwrap_or(0))
+        });
+        let changed = {
+            let mut s = self.shared.settings();
+            match record {
+                Some(r) => s.levers_on_card_by_gpu.insert(name, r.clone()) != Some(r),
+                None => s.levers_on_card_by_gpu.remove(&name).is_some(),
+            }
+        };
+        if changed {
+            self.shared.save_settings();
+        }
+    }
+
     // ------------------------------------------------------------------ actions
 
     /// Apply button: trial the editor as a profile.
@@ -2302,6 +2399,8 @@ impl MainViewModel {
     /// Take a finished job's result back on the UI thread.
     pub fn finish(&mut self, outcome: Outcome) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        // Apply, Reset, a lever and the startup trial can all move a lever; a window's own job cannot.
+        let moves_levers = !matches!(outcome.0, OutcomeKind::Custom(_));
         match outcome.0 {
             OutcomeKind::Custom(apply) => apply(self),
             OutcomeKind::Apply { profile_name, errors, slot, name_saved, recovery_idle, applied, readback } => {
@@ -2385,6 +2484,9 @@ impl MainViewModel {
                 self.shared.settings().apply_on_startup = registered;
                 self.shared.save_settings();
             }
+        }
+        if moves_levers {
+            self.remember_levers_on_card();
         }
     }
 }

@@ -870,3 +870,129 @@ fn memory_clock_range_is_written_and_full_means_unpinned() {
     vm.run_jobs_inline();
     assert_eq!(mock(&f), (810, 810), "{}", vm.status);
 }
+
+// ------------------------------------------------------------------ profile round trip
+
+/// Every slider moved off its default, every XOC lever armed, saved to a slot, reset, then
+/// loaded back by clicking the slot: what reaches the card is what was saved.
+#[test]
+fn a_slot_applies_every_setting_it_saved() {
+    for (label, f) in [("rtx40", fixture()), ("rtx50", rtx50_fixture())] {
+        let mut vm = vm(&f);
+        for lever in [
+            XocLever::NVVDD,
+            XocLever::MSVDD,
+            XocLever::NVVDD_OCP,
+            XocLever::MSVDD_OCP,
+            XocLever::CLOCK_RANGE,
+            XocLever::MEMORY_CLOCK,
+        ] {
+            vm.set_lever(lever, true);
+            vm.run_jobs_inline();
+        }
+        // A value inside each range but away from both ends and the default.
+        for field in Field::ALL {
+            let (lo, hi) = vm.bounds(field);
+            if hi <= lo {
+                continue;
+            }
+            let pick = if field == Field::ClockLockMin || field == Field::MemoryLockMin {
+                lo + (hi - lo) / 4
+            } else {
+                lo + (hi - lo) * 3 / 4
+            };
+            vm.set(field, pick);
+        }
+        vm.set(Field::PowerLimit, vm.bounds(Field::PowerLimit).1);
+        vm.set(Field::SoftTempLimit, 80);
+        vm.set(Field::TempLimit, vm.bounds(Field::TempLimit).1);
+        vm.set_save_armed(true);
+        vm.on_slot_clicked(3);
+        let saved = f.shared.store.load("Slot 3").unwrap().unwrap();
+
+        vm.reset();
+        vm.run_jobs_inline();
+        let mut fresh = MainViewModel::new(f.shared.clone());
+        fresh.on_slot_clicked(3);
+        fresh.run_jobs_inline();
+        assert!(!fresh.status_is_error, "{label}: {}", fresh.status);
+        let applied = f.shared.service.applied_profile().expect("applied");
+        let mut want = saved.clone();
+        want.name = applied.name.clone();
+        want.modified_utc = applied.modified_utc;
+        let (a, w) = (format!("{applied:#?}"), format!("{want:#?}"));
+        let diff: Vec<String> = a
+            .lines()
+            .zip(w.lines())
+            .filter(|(x, y)| x != y)
+            .map(|(x, y)| format!("applied {} | saved {}", x.trim(), y.trim()))
+            .collect();
+        assert!(diff.is_empty(), "{label}: slot 3 did not apply as saved:\n{}", diff.join("\n"));
+        let st = f.shared.service.read_tuning_state().unwrap();
+        assert_eq!(st.power_limit_percent, saved.power_limit_percent, "{label}: power on the card");
+    }
+}
+
+/// The card does not store the software temperature limit, so a relaunch shows the last slot's
+/// value rather than falling back to the card's own 88 °C.
+#[test]
+fn soft_temp_survives_a_relaunch() {
+    for (want, enforced) in [(105, false), (80, true)] {
+        let f = rtx50_fixture();
+        let mut vm = vm(&f);
+        vm.set(Field::SoftTempLimit, want);
+        vm.set_save_armed(true);
+        vm.on_slot_clicked(1);
+        vm.on_slot_clicked(1);
+        vm.run_jobs_inline();
+        assert_eq!(vm.get(Field::SoftTempLimit), want, "after applying the slot");
+
+        // A new run of the app: a fresh service that has applied nothing yet.
+        let service = Arc::new(TuningService::new(Box::new(MockBackend::without_hardware_temp_limit())));
+        service.initialize(0).unwrap();
+        let shared = Shared::new(service, f.shared.store.clone(), f.shared.settings().clone(), f.startup.clone());
+        let relaunched = MainViewModel::new(shared);
+        assert_eq!(relaunched.get(Field::SoftTempLimit), want, "after a relaunch");
+        assert_eq!(relaunched.pending_changes(), enforced, "{want} °C needs an Apply to run: {}", relaunched.status);
+    }
+}
+
+/// A lever an earlier run left on the card shows as armed after a relaunch, and Disable releases
+/// it — including one the card cannot report back (the memory clock lock).
+#[test]
+fn levers_left_on_the_card_survive_a_relaunch() {
+    let f = fixture();
+    let mut vm = vm(&f);
+    let lo = vm.caps.memory_lock_min_mhz;
+    vm.set(Field::MemoryLockMin, lo);
+    vm.set(Field::MemoryLockMax, lo);
+    vm.set_lever(XocLever::MEMORY_CLOCK, true);
+    vm.run_jobs_inline();
+    assert!(vm.is_armed(XocLever::MEMORY_CLOCK), "{}", vm.status);
+
+    // A new run: the lock is still in the driver, and nothing in the new process knows it.
+    let mut mock = MockBackend::new();
+    mock.memory_lock = (lo, lo);
+    let service = Arc::new(TuningService::new(Box::new(mock)));
+    service.initialize(0).unwrap();
+    let shared = Shared::new(service.clone(), f.shared.store.clone(), f.shared.settings().clone(), f.startup.clone());
+    let mut again = MainViewModel::new(shared.clone());
+    assert!(again.is_armed(XocLever::MEMORY_CLOCK), "shown as live after a relaunch: {}", again.xoc_status_text());
+    assert_eq!((again.get(Field::MemoryLockMin), again.get(Field::MemoryLockMax)), (lo, lo));
+    assert!(service.armed_on_card().has(XocLever::MEMORY_CLOCK));
+    assert!(!again.pending_changes(), "nothing to apply: it is what the card holds");
+
+    again.set_lever(XocLever::MEMORY_CLOCK, false);
+    again.run_jobs_inline();
+    let lock = service.with_backend(|b| b.as_mock().unwrap().memory_lock);
+    assert_eq!(lock, (0, 0), "Disable released a lock an earlier run set");
+    assert!(shared.settings().levers_on_card_by_gpu.is_empty(), "and the record went with it");
+
+    // Reset clears the record too.
+    again.set_lever(XocLever::MEMORY_CLOCK, true);
+    again.run_jobs_inline();
+    assert!(!shared.settings().levers_on_card_by_gpu.is_empty());
+    again.reset();
+    again.run_jobs_inline();
+    assert!(shared.settings().levers_on_card_by_gpu.is_empty(), "Reset leaves nothing on the card");
+}

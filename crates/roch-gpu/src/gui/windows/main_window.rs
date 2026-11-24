@@ -473,16 +473,69 @@ fn profile_bar(ui: &mut Ui, vm: &mut MainViewModel, actions: &mut Vec<MainAction
 fn measure_bottom(ui: &mut Ui, vm: &MainViewModel) -> f32 {
     // Apply panel: margin 12 + padding 6+6 + button 42 (+ the pending line), then the footer block.
     let pending = if vm.pending_changes() { 6.0 + theme::pitch(15.0) } else { 0.0 };
-    let error = if vm.status_is_error { 32.0 } else { 0.0 };
-    let summary =
-        if crate::gui::preferences::current(ui.ctx()).show_applied_summary { summary_height(ui, vm) } else { 0.0 };
-    12.0 + 12.0 + theme::pitch(42.0) + pending + 6.0 + error + summary + theme::pitch(24.0)
+    let w = footer_inner_width(ui);
+    let error = if vm.status_is_error { wrapped_height(ui, &vm.status, w) } else { 0.0 };
+    let prefs = crate::gui::preferences::current(ui.ctx());
+    let summary = if prefs.show_applied_summary { summary_height(ui, vm, w) + SUMMARY_GAP } else { 0.0 };
+    let status = match status_overflow(ui, vm, prefs.show_footer_links, w) {
+        Some(text) => wrapped_height(ui, &text, w),
+        None => 0.0,
+    };
+    12.0 + 12.0 + theme::pitch(42.0) + pending + 6.0 + error + summary + theme::pitch(24.0) + status + 6.0
 }
 
-fn summary_height(ui: &Ui, vm: &MainViewModel) -> f32 {
-    let w = ui.available_width();
-    let galley = ui.painter().layout(vm.applied_summary().to_string(), theme::regular(BODY), Color32::WHITE, w);
-    galley.size().y.min(48.0)
+/// Side padding of the footer block, matching the Apply panel above it so the text lines up.
+const FOOTER_PAD_X: f32 = 10.0;
+/// Space between the applied summary and the links row.
+const SUMMARY_GAP: f32 = 4.0;
+/// The applied summary may wrap to this many rows before it ends in "…".
+const SUMMARY_ROWS: usize = 3;
+
+fn footer_inner_width(ui: &Ui) -> f32 {
+    ui.available_width() - 2.0 * FOOTER_PAD_X
+}
+
+fn wrapped_height(ui: &Ui, text: &str, w: f32) -> f32 {
+    ui.painter().layout(text.to_string(), theme::regular(BODY), Color32::WHITE, w).size().y
+}
+
+fn summary_height(ui: &Ui, vm: &MainViewModel, w: f32) -> f32 {
+    let row = ui.painter().layout_no_wrap("Ag".into(), theme::regular(BODY), Color32::WHITE).size().y;
+    wrapped_height(ui, vm.applied_summary(), w).min(row * SUMMARY_ROWS as f32 + 1.0)
+}
+
+/// The footer's status text: the busy label while working, otherwise the last status message.
+fn footer_status(vm: &MainViewModel) -> String {
+    match vm.busy_label() {
+        Some(label) => label.to_string(),
+        None => vm.status.clone(),
+    }
+}
+
+/// Width the YouTube | X | Discord links take on the footer row, plus the gap after them.
+fn links_width(ui: &Ui, show: bool) -> f32 {
+    if !show {
+        return 0.0;
+    }
+    let painter = ui.painter();
+    let names: f32 = FOOTER_LINKS
+        .iter()
+        .map(|(name, _)| painter.layout_no_wrap(name.to_string(), theme::bold(BODY), Color32::WHITE).size().x)
+        .sum();
+    let sep = painter.layout_no_wrap(" | ".into(), theme::regular(BODY), Color32::WHITE).size().x;
+    names + sep * (FOOTER_LINKS.len() - 1) as f32 + 12.0
+}
+
+/// A status too long to sit beside the links gets its own wrapped line under them, so it is read
+/// in full instead of being cut off with "…". `None` when it fits on the row, is empty, or is an
+/// error (an error is already shown in full above the summary).
+fn status_overflow(ui: &Ui, vm: &MainViewModel, show_links: bool, w: f32) -> Option<String> {
+    let status = footer_status(vm);
+    if status.is_empty() || (vm.status_is_error && vm.busy_label().is_none()) {
+        return None;
+    }
+    let need = ui.painter().layout_no_wrap(status.clone(), theme::regular(BODY), Color32::WHITE).size().x;
+    (need > w - links_width(ui, show_links)).then_some(status)
 }
 
 fn apply_panel(ui: &mut Ui, vm: &mut MainViewModel) {
@@ -516,61 +569,69 @@ fn apply_panel(ui: &mut Ui, vm: &mut MainViewModel) {
 fn footer(ui: &mut Ui, vm: &MainViewModel, actions: &mut Vec<MainAction>) {
     let p = pal(ui.ctx());
     ui.add_space(6.0);
-    if vm.status_is_error {
-        ui.add(
-            egui::Label::new(RichText::new(&vm.status).font(theme::regular(BODY)).color(p.danger))
-                .wrap()
-                .selectable(false),
-        )
-        .on_hover_text(&vm.status);
-    }
     let prefs = crate::gui::preferences::current(ui.ctx());
-    if prefs.show_applied_summary {
-        let summary = vm.applied_summary();
-        let mut job =
-            egui::text::LayoutJob::simple(summary.to_string(), theme::regular(BODY), p.text, ui.available_width());
-        job.wrap.max_rows = 3;
-        job.wrap.overflow_character = Some('…');
-        ui.add(egui::Label::new(job).selectable(false)).on_hover_text(summary);
-    }
-
-    // The shared 24 px footer: social links left, status right.
-    let w = ui.available_width();
-    ui.allocate_ui_with_layout(vec2(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for (i, (name, url)) in FOOTER_LINKS.iter().enumerate() {
-            if !prefs.show_footer_links {
-                break;
-            }
-            if i > 0 {
-                ui.label(RichText::new(" | ").font(theme::regular(BODY)).color(p.text));
-            }
-            let galley = ui.painter().layout_no_wrap(name.to_string(), theme::bold(BODY), p.brand);
-            let (r, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
-            let color = if resp.hovered() { p.brand_hover } else { p.brand };
-            ui.painter().galley_with_override_text_color(r.min, galley, color);
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            let resp = if *name == "X" { resp.on_hover_text(*url) } else { resp };
-            if resp.clicked() {
-                actions.push(MainAction::OpenUrl(url));
-            }
+    let pad = FOOTER_PAD_X as i8;
+    egui::Frame::new().inner_margin(egui::Margin { left: pad, right: pad, top: 0, bottom: 6 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let w = ui.available_width();
+        if vm.status_is_error {
+            ui.add(
+                egui::Label::new(RichText::new(&vm.status).font(theme::regular(BODY)).color(p.danger))
+                    .wrap()
+                    .selectable(false),
+            )
+            .on_hover_text(&vm.status);
         }
-        ui.add_space(12.0);
-        let (status, color) = match vm.busy_label() {
-            Some(label) => (label.to_string(), p.text),
-            None => (vm.status.clone(), if vm.status_is_error { p.danger } else { p.text }),
-        };
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-        let mut job = egui::text::LayoutJob::simple_singleline(status.clone(), theme::regular(BODY), color);
-        job.wrap.max_width = rect.width();
-        job.wrap.max_rows = 1;
-        job.wrap.break_anywhere = true;
-        job.wrap.overflow_character = Some('…');
-        let galley = ui.painter().layout_job(job);
-        let pos = pos2(rect.right() - galley.size().x, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(pos, galley, color);
-        if !status.is_empty() {
-            resp.on_hover_text(status);
+        if prefs.show_applied_summary {
+            let summary = vm.applied_summary();
+            let mut job = egui::text::LayoutJob::simple(summary.to_string(), theme::regular(BODY), p.text, w);
+            job.wrap.max_rows = SUMMARY_ROWS;
+            job.wrap.overflow_character = Some('…');
+            ui.add(egui::Label::new(job).selectable(false)).on_hover_text(summary);
+            ui.add_space(SUMMARY_GAP);
+        }
+
+        let overflow = status_overflow(ui, vm, prefs.show_footer_links, w);
+        let status = footer_status(vm);
+        let color = if vm.status_is_error && vm.busy_label().is_none() { p.danger } else { p.text };
+
+        // The shared 24 px footer: social links left, status right when it fits.
+        ui.allocate_ui_with_layout(vec2(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (i, (name, url)) in FOOTER_LINKS.iter().enumerate() {
+                if !prefs.show_footer_links {
+                    break;
+                }
+                if i > 0 {
+                    ui.label(RichText::new(" | ").font(theme::regular(BODY)).color(p.text));
+                }
+                let galley = ui.painter().layout_no_wrap(name.to_string(), theme::bold(BODY), p.brand);
+                let (r, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+                let color = if resp.hovered() { p.brand_hover } else { p.brand };
+                ui.painter().galley_with_override_text_color(r.min, galley, color);
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let resp = if *name == "X" { resp.on_hover_text(*url) } else { resp };
+                if resp.clicked() {
+                    actions.push(MainAction::OpenUrl(url));
+                }
+            }
+            ui.add_space(12.0);
+            // An error is already shown in full above; one too long for this row goes below it.
+            let on_row = if overflow.is_some() || (vm.status_is_error && vm.busy_label().is_none()) {
+                String::new()
+            } else {
+                status.clone()
+            };
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+            let galley = ui.painter().layout_no_wrap(on_row, theme::regular(BODY), color);
+            let pos = pos2(rect.right() - galley.size().x, rect.center().y - galley.size().y / 2.0);
+            ui.painter().galley(pos, galley, color);
+        });
+
+        if let Some(text) = overflow {
+            ui.add(
+                egui::Label::new(RichText::new(text).font(theme::regular(BODY)).color(color)).wrap().selectable(false),
+            );
         }
     });
 }

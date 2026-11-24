@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::models::TuningProfile;
+use crate::models::{GpuTuningState, TuningProfile, XocLever};
+use crate::util::same_boot;
 
 pub struct ProfileStore {
     root: PathBuf,
@@ -334,6 +335,132 @@ pub struct AppSettings {
     /// Stock OCP limits per GPU, in milliamps, recorded the first time the card is seen.
     pub nvvdd_ocp_default_by_gpu: BTreeMap<String, i32>,
     pub msvdd_ocp_default_by_gpu: BTreeMap<String, i32>,
+    /// The gated levers this app last left on each GPU, so the next run knows they are still there.
+    pub levers_on_card_by_gpu: BTreeMap<String, LeversOnCard>,
+}
+
+/// The gated (XOC) levers this app last left on one card, with the values it wrote.
+///
+/// A lever outlives the process that set it, but a new run cannot always see it: the card reports
+/// its rails and OCP limits back, yet has no getter for the memory clock lock or (on NVIDIA) the
+/// core clock range. Without this record a new run showed "nothing armed" over a memory clock still
+/// pinned at 810 MHz, and its Disable could not release a lever it did not know was on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct LeversOnCard {
+    /// [`XocLever`] bits; the main clock offsets (XBAR/SYS/video) are not kept, every Apply writes them.
+    pub levers: u32,
+    pub voltage_rail_max_mv: i32,
+    pub voltage_rail_floor_mv: i32,
+    pub msvdd_rail_max_mv: i32,
+    pub msvdd_rail_floor_mv: i32,
+    pub nvvdd_ocp_milliamps: i32,
+    pub msvdd_ocp_milliamps: i32,
+    pub clock_lock_min_mhz: i32,
+    pub clock_lock_max_mhz: i32,
+    pub memory_clock_lock_min_mhz: i32,
+    pub memory_clock_lock_max_mhz: i32,
+    /// When the OS had started at the time of writing ([`crate::util::boot_time_unix_s`]): a restart
+    /// clears the clock locks, so a lever the card cannot report is trusted only within one boot.
+    pub boot_unix_s: i64,
+}
+
+impl LeversOnCard {
+    /// Which levers are on, from `levers`, and their values, from the profile that set them.
+    pub fn new(levers: XocLever, p: &TuningProfile, boot_unix_s: i64) -> Self {
+        Self {
+            levers: levers.0,
+            voltage_rail_max_mv: p.voltage_rail_max_mv,
+            voltage_rail_floor_mv: p.voltage_rail_floor_mv,
+            msvdd_rail_max_mv: p.msvdd_rail_max_mv,
+            msvdd_rail_floor_mv: p.msvdd_rail_floor_mv,
+            nvvdd_ocp_milliamps: p.nvvdd_ocp_milliamps,
+            msvdd_ocp_milliamps: p.msvdd_ocp_milliamps,
+            clock_lock_min_mhz: p.clock_lock_min_mhz,
+            clock_lock_max_mhz: p.clock_lock_max_mhz,
+            memory_clock_lock_min_mhz: p.memory_clock_lock_min_mhz,
+            memory_clock_lock_max_mhz: p.memory_clock_lock_max_mhz,
+            boot_unix_s,
+        }
+    }
+
+    pub fn levers(&self) -> XocLever {
+        XocLever(self.levers)
+    }
+
+    /// The recorded levers still on the card. One the card reports back must still read what was
+    /// written (something else may have moved it since); one it cannot report is kept only if the
+    /// OS has not restarted since it was written. `boot_now` is [`crate::util::boot_time_unix_s`].
+    pub fn still_on_card(&self, live: &GpuTuningState, boot_now: Option<i64>) -> XocLever {
+        let same_boot = boot_now.is_some_and(|b| same_boot(b, self.boot_unix_s));
+        // `readable` is whether the card reports this lever at all; when it does not, only the boot
+        // can vouch for it.
+        let check = |readable: bool, matches: bool| if readable { matches } else { same_boot };
+        let floor_ok = |live_mv: i32, want: i32| live_mv <= 0 || want <= 0 || live_mv == want;
+        let mut on = XocLever::NONE;
+        let mut keep = |lever: XocLever, ok: bool| {
+            if self.levers().has(lever) && ok {
+                on |= lever;
+            }
+        };
+        keep(
+            XocLever::NVVDD,
+            check(
+                live.voltage_rail_max_mv > 0,
+                live.voltage_rail_max_mv == self.voltage_rail_max_mv
+                    && floor_ok(live.voltage_rail_floor_mv, self.voltage_rail_floor_mv),
+            ),
+        );
+        keep(
+            XocLever::MSVDD,
+            check(
+                live.msvdd_rail_max_mv > 0,
+                live.msvdd_rail_max_mv == self.msvdd_rail_max_mv
+                    && floor_ok(live.msvdd_rail_floor_mv, self.msvdd_rail_floor_mv),
+            ),
+        );
+        keep(
+            XocLever::NVVDD_OCP,
+            check(live.nvvdd_ocp_milliamps > 0, live.nvvdd_ocp_milliamps == self.nvvdd_ocp_milliamps),
+        );
+        keep(
+            XocLever::MSVDD_OCP,
+            check(live.msvdd_ocp_milliamps > 0, live.msvdd_ocp_milliamps == self.msvdd_ocp_milliamps),
+        );
+        keep(
+            XocLever::CLOCK_RANGE,
+            check(
+                live.locked_clock_min_mhz > 0 || live.locked_clock_max_mhz > 0,
+                live.locked_clock_min_mhz == self.clock_lock_min_mhz
+                    && live.locked_clock_max_mhz == self.clock_lock_max_mhz,
+            ),
+        );
+        keep(XocLever::MEMORY_CLOCK, same_boot);
+        on
+    }
+
+    /// Put the recorded values of `levers` into `p`.
+    pub fn fill(&self, levers: XocLever, p: &mut TuningProfile) {
+        if levers.has(XocLever::NVVDD) {
+            (p.voltage_rail_max_mv, p.voltage_rail_floor_mv) = (self.voltage_rail_max_mv, self.voltage_rail_floor_mv);
+        }
+        if levers.has(XocLever::MSVDD) {
+            (p.msvdd_rail_max_mv, p.msvdd_rail_floor_mv) = (self.msvdd_rail_max_mv, self.msvdd_rail_floor_mv);
+        }
+        if levers.has(XocLever::NVVDD_OCP) {
+            p.nvvdd_ocp_milliamps = self.nvvdd_ocp_milliamps;
+        }
+        if levers.has(XocLever::MSVDD_OCP) {
+            p.msvdd_ocp_milliamps = self.msvdd_ocp_milliamps;
+        }
+        if levers.has(XocLever::CLOCK_RANGE) {
+            (p.clock_lock_min_mhz, p.clock_lock_max_mhz) = (self.clock_lock_min_mhz, self.clock_lock_max_mhz);
+        }
+        if levers.has(XocLever::MEMORY_CLOCK) {
+            (p.memory_clock_lock_min_mhz, p.memory_clock_lock_max_mhz) =
+                (self.memory_clock_lock_min_mhz, self.memory_clock_lock_max_mhz);
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -356,6 +483,7 @@ impl Default for AppSettings {
             msvdd_default_max_by_gpu: BTreeMap::new(),
             nvvdd_ocp_default_by_gpu: BTreeMap::new(),
             msvdd_ocp_default_by_gpu: BTreeMap::new(),
+            levers_on_card_by_gpu: BTreeMap::new(),
         }
     }
 }
@@ -386,6 +514,35 @@ mod tests {
         assert!(!store.delete("A").unwrap());
         assert!(store.load("missing").unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn levers_on_card_trust_the_card_then_the_boot() {
+        let p = TuningProfile {
+            voltage_rail_max_mv: 1100,
+            voltage_rail_floor_mv: 850,
+            nvvdd_ocp_milliamps: 280_000,
+            memory_clock_lock_min_mhz: 810,
+            memory_clock_lock_max_mhz: 810,
+            ..Default::default()
+        };
+        let all = XocLever::NVVDD | XocLever::NVVDD_OCP | XocLever::MEMORY_CLOCK;
+        let rec = LeversOnCard::new(all, &p, 1_000_000);
+        let live = || GpuTuningState {
+            voltage_rail_max_mv: 1100,
+            voltage_rail_floor_mv: 850,
+            nvvdd_ocp_milliamps: 280_000,
+            ..Default::default()
+        };
+        assert_eq!(rec.still_on_card(&live(), Some(1_000_030)), all, "same boot, and the card agrees");
+        // A restart clears the memory lock, which the card cannot report; the rest it confirms.
+        assert_eq!(rec.still_on_card(&live(), Some(2_000_000)), XocLever::NVVDD | XocLever::NVVDD_OCP);
+        assert_eq!(rec.still_on_card(&live(), None), XocLever::NVVDD | XocLever::NVVDD_OCP, "no uptime");
+        // Something else moved the rail since: it is not ours any more.
+        let moved = GpuTuningState { voltage_rail_max_mv: 1050, ..live() };
+        assert_eq!(rec.still_on_card(&moved, Some(1_000_000)), XocLever::NVVDD_OCP | XocLever::MEMORY_CLOCK);
+        // A lever never recorded is never taken over.
+        assert_eq!(LeversOnCard::default().still_on_card(&live(), Some(0)), XocLever::NONE);
     }
 
     #[test]

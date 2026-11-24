@@ -1444,20 +1444,11 @@ mod tests {
              command exits, so 83 °C is not enforced from here. Set it in the window, or in a startup profile.\n\
              Applied.\n"
         );
-        let (code, out, _) = run_mock("apply --mock rtx50 --soft-temp 99", &store);
-        assert_eq!(code, 0);
-        assert!(
-            out.contains("temperature limit 99 °C is at or above this card's own limit (88 °C) — left to the card."),
-            "99 °C is above the card's own limit: {out}"
-        );
-        assert!(!out.contains("is not enforced"), "nothing for the app to enforce: {out}");
-        let (code, out, _) = run_mock("apply --mock rtx50 --soft-temp 105", &store);
-        assert_eq!(code, 0);
-        assert!(
-            out.contains("temperature limit 105 °C is at or above this card's own limit (88 °C) — left to the card."),
-            "{out}"
-        );
-        assert!(!out.contains("is not enforced"), "nothing for the app to enforce: {out}");
+        // At or above the card's own limit there is nothing to enforce and nothing to note.
+        for t in [99, 105] {
+            let (code, out, _) = run_mock(&format!("apply --mock rtx50 --soft-temp {t}"), &store);
+            assert_eq!((code, out.as_str()), (0, "Applied.\n"), "{t} °C is above the card's own limit");
+        }
         let (code, out, _) = run_mock("apply --mock rtx50 --soft-temp off", &store);
         assert_eq!((code, out.as_str()), (0, "Applied.\n"), "off needs no note");
         let (code, _, _) = run_mock("apply --mock rtx50 --soft-temp hot", &store);

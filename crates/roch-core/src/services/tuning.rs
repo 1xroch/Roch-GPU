@@ -678,7 +678,6 @@ fn add_clamp_notes(notes: &mut Vec<String>, caps: &GpuCapabilities, asked: &Tuni
         note("fan speed", asked.fixed_fan_percent, applied.fixed_fan_percent, "%");
     }
     if caps.can_set_soft_thermal_limit && asked.soft_thermal_limit_c > 0 {
-        let off = caps.soft_thermal_off_c();
         if applied.soft_thermal_limit_c == 0 {
             notes.push(format!(
                 "{NOTE_PREFIX} temperature limit {} °C is outside this card's window — applied off (the card's own limit).",
@@ -689,14 +688,10 @@ fn add_clamp_notes(notes: &mut Vec<String>, caps: &GpuCapabilities, asked: &Tuni
                 "{NOTE_PREFIX} software temperature limit {} °C is outside this card's range — applied {} °C instead.",
                 asked.soft_thermal_limit_c, applied.soft_thermal_limit_c
             ));
-        } else if applied.soft_thermal_limit_c >= off {
-            // The range runs on to 105 °C, but at or above the card's limit the card holds itself:
-            // the value is kept, yet the software controller is off.
-            notes.push(format!(
-                "{NOTE_PREFIX} temperature limit {} °C is at or above this card's own limit ({off} °C) — left to the card.",
-                applied.soft_thermal_limit_c
-            ));
         }
+        // The range runs on to 105 °C; at or above the card's own limit the value is kept and the
+        // card holds itself. That is a choice, not a surprise, so it gets no note (the log and the
+        // slider's tooltip still say so).
     }
 }
 
@@ -1335,6 +1330,18 @@ impl TuningService {
     /// without touching the hardware.
     pub fn armed_on_card(&self) -> XocLever {
         self.state().armed_on_card
+    }
+
+    /// Take over levers an earlier run left on the card (see `LeversOnCard`), so this run treats
+    /// them as its own: reported live, and released when disarmed rather than left standing. Only
+    /// before this run has written anything; returns what was taken over.
+    pub fn adopt_levers_on_card(&self, levers: XocLever) -> XocLever {
+        let mut st = self.state();
+        if st.applied.is_some() || !st.armed_on_card.is_empty() {
+            return XocLever::NONE;
+        }
+        st.armed_on_card = levers & st.supported_levers();
+        st.armed_on_card
     }
 
     /// Latest foreground telemetry sample.

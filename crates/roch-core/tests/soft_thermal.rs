@@ -483,17 +483,12 @@ fn clamp_is_noted() {
     assert!(errs.is_empty(), "{errs:?}");
     assert_eq!(svc.soft_thermal_status().limit_c, 87);
     // At or above the card's own limit the value is kept, but the card manages itself.
+    // No note: that is what the slider's top end is for.
     let errs = svc.apply(&limit(97));
-    assert_eq!(
-        errs,
-        vec!["Note: temperature limit 97 °C is at or above this card's own limit (88 °C) — left to the card."]
-    );
+    assert!(errs.is_empty(), "{errs:?}");
     assert_eq!(svc.soft_thermal_status().limit_c, 0);
     let errs = svc.apply(&limit(105));
-    assert_eq!(
-        errs,
-        vec!["Note: temperature limit 105 °C is at or above this card's own limit (88 °C) — left to the card."]
-    );
+    assert!(errs.is_empty(), "{errs:?}");
     assert_eq!(svc.soft_thermal_status().limit_c, 0);
     // Beyond the window is clamped to off.
     let errs = svc.apply(&limit(106));
