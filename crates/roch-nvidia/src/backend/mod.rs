@@ -417,12 +417,21 @@ pub fn domain_name(type_: i32) -> String {
 
 /// What each power-monitor channel is, by position. The driver gives no names; these come from
 /// matching all six currents at once against a comparison monitor on the same card under the same
-/// load (board total 25.75 A to its 26.375, PCIe 0.58 to 0.585, ...). The "Rail NNN" names are that
-/// monitor's own labels, carrying the driver's identifier. Positional, so only applied to a card
+/// load (board total 25.75 A to its 26.375, PCIe 0.58 to 0.585, ...). That monitor labelled three of
+/// them only by the driver's identifier (Rail 218, 214, 212); they are named here by how the readings
+/// add up, which held to 0.01 A on a 5070 Ti: total = PCIe slot + 218 (the power connector),
+/// 214 = NVVDD input + 212 (the GPU's rails), total = 214 + Misc0. Positional, so only applied to a card
 /// reporting exactly this many channels; anything else is numbered plainly.
 pub fn power_rail_name(index: i32, total: i32) -> String {
-    const KNOWN: [&str; 7] =
-        ["Board total", "PCIe slot 12 V", "Rail 218", "Rail 214", "NVVDD input", "Rail 212", "Misc0 input"];
+    const KNOWN: [&str; 7] = [
+        "Board total",
+        "PCIe slot 12 V",
+        "Power connector 12 V",
+        "GPU rails (NVVDD + other)",
+        "NVVDD input",
+        "Other GPU rail input",
+        "Misc0 input",
+    ];
     if total == KNOWN.len() as i32 && index >= 0 && (index as usize) < KNOWN.len() {
         KNOWN[index as usize].into()
     } else {

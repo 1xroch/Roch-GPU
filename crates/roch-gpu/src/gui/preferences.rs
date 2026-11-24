@@ -332,6 +332,9 @@ pub struct Prefs {
     pub cards: Vec<Card>,
     pub card_columns: usize,
     pub hidden_sensors: Vec<String>,
+    /// One row per memory chip in Telemetry. Off: a single "Memory chips (hottest)" row stands for
+    /// them, which is all a healthy card needs; on, for finding the one chip a bad pad cooks.
+    pub show_each_memory_chip: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -377,6 +380,7 @@ impl Default for Prefs {
                 .collect(),
             card_columns: 3,
             hidden_sensors: Vec::new(),
+            show_each_memory_chip: false,
         }
     }
 }
@@ -426,6 +430,7 @@ impl Prefs {
         p.show_footer_links = flag(map, "show_footer_links", true);
         p.show_gpu_details = flag(map, "show_gpu_details", true);
         p.show_applied_summary = flag(map, "show_applied_summary", true);
+        p.show_each_memory_chip = flag(map, "show_each_memory_chip", false);
         p.card_columns = map.get("card_columns").and_then(Value::as_u64).unwrap_or(3).clamp(1, 6) as usize;
         if let Some(saved) = map.get("positions").and_then(Value::as_object) {
             for (name, position) in saved.iter().take(16) {
@@ -488,7 +493,8 @@ impl Prefs {
             "show_gpu_details": self.show_gpu_details, "show_applied_summary": self.show_applied_summary,
             "panels": self.panels.iter().map(|p| json!({"key":p.key,"visible":p.visible})).collect::<Vec<_>>(),
             "cards": self.cards.iter().map(|c| json!({"sensor":c.sensor,"label":c.label})).collect::<Vec<_>>(),
-            "card_columns": self.card_columns, "hidden_sensors": self.hidden_sensors})
+            "card_columns": self.card_columns, "hidden_sensors": self.hidden_sensors,
+            "show_each_memory_chip": self.show_each_memory_chip})
     }
     pub fn colors(&self, dark: bool) -> &Colors {
         if dark { &self.dark } else { &self.light }
@@ -553,6 +559,7 @@ mod tests {
         p.cards[0].label = "My temperature".into();
         p.positions.insert("Roch GPU".into(), (-1800, 125));
         p.hidden_sensors = vec!["fanrpm0".into()];
+        p.show_each_memory_chip = true;
         assert_eq!(Prefs::from_json(&p.to_json(), false, 1000), p);
     }
     #[test]

@@ -409,6 +409,13 @@ impl SettingsWindow {
         if ui.add_enabled(p.cards.len() < 24, egui::Button::new("Add card")).clicked() {
             p.cards.push(Card { sensor: "temp".into(), label: "GPU temperature".into() });
         }
+        section(ui, "Memory chips");
+        ui.checkbox(&mut p.show_each_memory_chip, "Show each memory chip");
+        hint(
+            ui,
+            "Off: one \"Memory chips (hottest)\" row shows the hottest chip and which one it is. On: a row \
+             for every chip as well, for tracking down a single chip that runs hot.",
+        );
         section(ui, "Visible sensor rows");
         ui.add(egui::TextEdit::singleline(&mut self.sensor_filter).hint_text("Filter sensors"));
         let filter = self.sensor_filter.to_lowercase();

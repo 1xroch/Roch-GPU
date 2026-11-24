@@ -21,7 +21,7 @@ use roch_core::GpuTelemetry;
 use roch_core::util::dotnet_custom;
 
 use super::{ChildChrome, Placement, Tap, WinCtx, content_frame};
-use crate::gui::telemetry_table::{TelemetryRow, TelemetryTable};
+use crate::gui::telemetry_table::{TelemetryRow, TelemetryTable, is_memory_chip_key};
 use crate::gui::theme::{self, BODY, Palette, pal};
 use crate::gui::widgets::{self, ButtonKind};
 
@@ -137,7 +137,8 @@ impl MonitorWindow {
         table.add(t, Some(extra));
         self.summary =
             [summary(t.temperature_c, "°C", 1), summary(t.core_clock_mhz, "MHz", 0), summary(t.power_watts, "W", 1)];
-        self.elapsed = format!("{} sensors  ·  {}", table.sensor_count(), hms(self.stats_since.elapsed().as_secs()));
+        // The sensor count is added when drawn: it counts what the preferences leave visible.
+        self.elapsed = hms(self.stats_since.elapsed().as_secs());
     }
 
     /// Take in the samples that have arrived.
@@ -250,6 +251,8 @@ impl MonitorWindow {
         let footer_h = 13.0 + 28.0;
         let body_h = (ui.available_height() - footer_h).max(40.0);
         let rows: &[TelemetryRow] = self.table.as_ref().map(TelemetryTable::rows).unwrap_or(&[]);
+        let hidden = hidden_keys(rows, &prefs.hidden_sensors, prefs.show_each_memory_chip);
+        let shown = (0..rows.len()).filter(|&i| !rows[i].is_header && row_visible(rows, i, &hidden)).count();
         ui.allocate_ui(vec2(ui.available_width(), body_h), |ui| {
             ui.set_min_height(body_h);
             ui.scope(|ui| {
@@ -258,10 +261,8 @@ impl MonitorWindow {
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
-                        for (index, row) in rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| row_visible(rows, *index, &prefs.hidden_sensors))
+                        for (index, row) in
+                            rows.iter().enumerate().filter(|(index, _)| row_visible(rows, *index, &hidden))
                         {
                             let _ = index;
                             draw_row(ui, row, &p);
@@ -277,7 +278,12 @@ impl MonitorWindow {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.set_height(28.0);
-            ui.label(RichText::new(&self.elapsed).font(theme::regular(BODY)).color(p.text));
+            let footer = if self.table.is_some() {
+                format!("{shown} sensors  ·  {}", self.elapsed)
+            } else {
+                self.elapsed.clone()
+            };
+            ui.label(RichText::new(footer).font(theme::regular(BODY)).color(p.text));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::text_button(ui, "Reset statistics", ButtonKind::Normal, vec2(12.0, 6.0), true)
                     .on_hover_text("Clear minimum, maximum and average values. GPU settings are not changed.")
@@ -310,6 +316,16 @@ fn columns(r: Rect) -> [Rect; 5] {
     for (i, c) in out.iter_mut().enumerate().skip(1) {
         let x0 = r.left() + NAME_COL + rest * (i - 1) as f32;
         *c = Rect::from_min_max(pos2(x0, r.top()), pos2(x0 + rest, r.bottom()));
+    }
+    out
+}
+
+/// The sensor keys not to draw: the ones hidden in Settings, and each memory chip's own row unless
+/// asked for (the "Memory chips (hottest)" row stands for them).
+fn hidden_keys(rows: &[TelemetryRow], hidden: &[String], show_each_chip: bool) -> Vec<String> {
+    let mut out = hidden.to_vec();
+    if !show_each_chip {
+        out.extend(rows.iter().filter_map(|r| r.sensor_key()).filter(|k| is_memory_chip_key(k)).map(str::to_string));
     }
     out
 }
@@ -439,6 +455,31 @@ mod tests {
         assert_eq!(c[0].width(), NAME_COL);
         assert!(c[1..].iter().all(|r| (r.width() - 100.0).abs() < 1e-3));
         assert_eq!(c[4].right(), 630.0);
+    }
+
+    #[test]
+    fn memory_chip_rows_show_only_when_asked_for() {
+        let chip = |key: &str, name: &str, v: f64| roch_core::SupplementalSensor::new(key, name, "°C", v);
+        let sample = GpuTelemetry {
+            supplemental_sensors: vec![
+                chip("nv:memchip-a0", "Memory chip A0", 54.0),
+                chip("nv:memchip-b2", "Memory chip B2", 58.0),
+            ],
+            ..GpuTelemetry::default()
+        };
+        let mut table = TelemetryTable::new(&sample, &roch_core::GpuCapabilities::default(), []);
+        table.add(&sample, None);
+        let rows = table.rows();
+        let shown = |each: bool| -> Vec<String> {
+            let hidden = hidden_keys(rows, &[], each);
+            (0..rows.len()).filter(|&i| row_visible(rows, i, &hidden)).map(|i| rows[i].name.clone()).collect()
+        };
+        let off = shown(false);
+        assert!(off.iter().any(|n| n == "Memory chips (hottest)"));
+        assert!(!off.iter().any(|n| n.starts_with("Memory chip ")), "each chip hidden by default: {off:?}");
+        let on = shown(true);
+        assert!(on.iter().any(|n| n == "Memory chip A0") && on.iter().any(|n| n == "Memory chip B2"));
+        assert!(on.iter().any(|n| n == "Memory chips (hottest)"), "the summary row stays with them");
     }
 
     #[test]

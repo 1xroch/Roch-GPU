@@ -64,13 +64,22 @@ impl TelemetryRow {
         }
     }
 
-    /// Re-read the statistic into the four display strings.
+    /// Re-read the statistic into the four display strings. A Yes/No row has no minimum or
+    /// maximum worth showing, and its average is the share of the time it was on; a PCIe link row
+    /// keeps its minimum and maximum (a link that drops speed at idle shows there) but not an average.
     fn refresh(&mut self, stats: &HashMap<String, SensorStat>) {
         let Some(s) = self.key.as_ref().and_then(|k| stats.get(k)) else { return };
         self.current = self.format(s.current);
+        if self.unit == "state" {
+            self.minimum = DASH.into();
+            self.maximum = DASH.into();
+            let a = s.average();
+            self.average = if a.is_nan() { DASH.into() } else { format!("{:.0} % of the time", a * 100.0) };
+            return;
+        }
         self.minimum = self.format(s.minimum);
         self.maximum = self.format(s.maximum);
-        self.average = self.format(s.average());
+        self.average = if is_link_unit(&self.unit) { DASH.into() } else { self.format(s.average()) };
     }
 
     fn format(&self, v: f64) -> String {
@@ -93,28 +102,66 @@ pub fn format_reading(v: f64, unit: &str, decimals: usize) -> String {
             format!("{:.1} % active", v * 100.0)
         };
     }
-    format!("{v:.decimals$} {unit}")
+    match unit {
+        "gen" => format!("Gen {v:.0}"),
+        "lanes" => format!("x{v:.0}"),
+        _ => format!("{v:.decimals$} {unit}"),
+    }
 }
 
 /// Names for the clock domains NVIDIA only numbers (C# `NvApiBackend.DomainName`; mirrors
 /// `roch_nvidia`'s copy, kept here so the window does not depend on a backend crate's internals).
-/// Checked against a 5070 Ti; a number with no name is more honest than a name with no evidence.
-pub fn domain_name(type_: i32) -> String {
+/// Checked against a 5070 Ti. A domain with no name gets no row: "Domain type 31" read a flat
+/// 0 MHz and told the reader nothing.
+pub fn domain_name(type_: i32) -> Option<&'static str> {
     match type_ {
-        3 => "HUBCLK".into(),
-        6 => "DISPCLK".into(),
-        20 => "L2CLK".into(),
-        22 => "Reference clock".into(),
-        _ => format!("Domain type {type_}"),
+        3 => Some("HUBCLK"),
+        6 => Some("DISPCLK"),
+        20 => Some("L2CLK"),
+        22 => Some("Reference clock"),
+        _ => None,
     }
 }
 
-/// What each power-monitor channel is, by position (C# `NvApiBackend.PowerRailName`). Positional,
-/// so only applied to a card reporting exactly this many channels; anything else is numbered.
+/// What each power-monitor channel is, by position (C# `NvApiBackend.PowerRailName`, mirrored in
+/// `roch_nvidia`). Positional, so only applied to a card reporting exactly this many channels;
+/// anything else is numbered.
+///
+/// The three the comparison monitor called only "Rail 218/214/212" are named by how the readings
+/// add up, which held to 0.01 A on a 5070 Ti in the current, minimum and average alike: the board
+/// total is the PCIe slot plus 218, so 218 is the power connector; 214 is NVVDD input plus 212, so
+/// 214 is the GPU's rails together and 212 the GPU rail other than the core's; and the board total
+/// is also 214 plus Misc0.
 pub fn power_rail_name(index: usize, total: usize) -> String {
-    const KNOWN: [&str; 7] =
-        ["Board total", "PCIe slot 12 V", "Rail 218", "Rail 214", "NVVDD input", "Rail 212", "Misc0 input"];
+    const KNOWN: [&str; 7] = [
+        "Board total",
+        "PCIe slot 12 V",
+        "Power connector 12 V",
+        "GPU rails (NVVDD + other)",
+        "NVVDD input",
+        "Other GPU rail input",
+        "Misc0 input",
+    ];
     if total == KNOWN.len() && index < KNOWN.len() { KNOWN[index].into() } else { format!("Rail {index}") }
+}
+
+/// The PCIe link figures read "Gen 5" and "x16"; their average says nothing, so it is not shown.
+fn is_link_unit(unit: &str) -> bool {
+    matches!(unit, "gen" | "lanes" | "GT/s")
+}
+
+/// The row that stands for every memory chip: the hottest of them, with which one it is.
+pub const HOTTEST_CHIP_KEY: &str = "memchips-hottest";
+
+/// One memory chip's own row (the NVIDIA backend's "Memory chip A0" sensors). The window shows
+/// these only when asked to; [`HOTTEST_CHIP_KEY`] stands for them otherwise.
+pub fn is_memory_chip_key(key: &str) -> bool {
+    key.starts_with("nv:memchip-")
+}
+
+/// "Memory chip B2" → "B2" (and "B2 (back)" for a back-of-board chip).
+fn chip_label(name: &str) -> String {
+    name.strip_prefix("Memory chip ").unwrap_or(name).to_string()
 }
 
 /// The whole table. Built once from the first sample, then fed a sample at a time.
@@ -123,6 +170,8 @@ pub struct TelemetryTable {
     rows: Vec<TelemetryRow>,
     stats: HashMap<String, SensorStat>,
     supplemental_keys: HashSet<String>,
+    /// Which chip is the hottest in the latest sample, for the [`HOTTEST_CHIP_KEY`] row.
+    hottest_chip: Option<String>,
 }
 
 impl TelemetryTable {
@@ -193,7 +242,9 @@ impl TelemetryTable {
             .collect();
         domains.sort_by_key(|&(n, _)| n);
         for (n, key) in domains {
-            t.sensor(key, &domain_name(n), "MHz", 0);
+            if let Some(name) = domain_name(n) {
+                t.sensor(key, name, "MHz", 0);
+            }
         }
 
         t.group("Load");
@@ -239,7 +290,8 @@ impl TelemetryTable {
         &self.rows
     }
 
-    /// Sensor rows (headings excluded), for the footer count.
+    /// Every sensor row, headings excluded (the audit dump's figure; the window counts what is visible).
+    #[cfg(test)]
     pub fn sensor_count(&self) -> usize {
         self.rows.iter().filter(|r| !r.is_header).count()
     }
@@ -313,6 +365,19 @@ impl TelemetryTable {
         self.put("tdp", t.power_percent);
         self.put("memused", t.memory_used_mb);
 
+        // The memory chips as one row, ahead of their own: the hottest, and which chip it is. Its
+        // minimum, maximum and average follow that hottest figure over the session.
+        let hottest = t
+            .supplemental_sensors
+            .iter()
+            .filter(|s| is_memory_chip_key(&s.key) && s.value.is_finite())
+            .max_by(|a, b| a.value.total_cmp(&b.value));
+        if hottest.is_some() && !self.stats.contains_key(HOTTEST_CHIP_KEY) {
+            self.insert_sensor(HOTTEST_CHIP_KEY, "Memory chips (hottest)", "°C");
+        }
+        self.hottest_chip = hottest.map(|h| chip_label(&h.name));
+        self.put(HOTTEST_CHIP_KEY, hottest.map_or(f64::NAN, |h| h.value));
+
         for s in &t.supplemental_sensors {
             if self.supplemental_keys.insert(s.key.clone()) {
                 self.insert_sensor(&s.key, &s.name, &s.unit);
@@ -352,6 +417,12 @@ impl TelemetryTable {
         let stats = &self.stats;
         for r in &mut self.rows {
             r.refresh(stats);
+            if r.key.as_deref() == Some(HOTTEST_CHIP_KEY)
+                && r.current != DASH
+                && let Some(chip) = &self.hottest_chip
+            {
+                r.current = format!("{} · {chip}", r.current);
+            }
         }
     }
 
@@ -524,7 +595,11 @@ mod tests {
             None,
         );
         assert_eq!(row(&table, "Power limit active").current, "Yes", "active limit displays Yes");
-        assert_eq!(row(&table, "Power limit active").average, "50.0 % active", "limit average is active fraction");
+        assert_eq!(row(&table, "Power limit active").average, "50 % of the time", "limit average is active share");
+        assert_eq!(row(&table, "Power limit active").minimum, "—", "a Yes/No row has no minimum");
+        assert_eq!(row(&table, "Power limit active").maximum, "—", "nor a maximum");
+        assert_eq!(row(&table, "PCIe link speed").minimum, "2.5 GT/s", "a link keeps its minimum");
+        assert_eq!(row(&table, "PCIe link speed").average, "—", "but has no average");
         assert_eq!(row(&table, "Video engine").current, "—", "missing video reading cleared");
         assert!(striped(&table));
     }
@@ -617,7 +692,6 @@ mod tests {
         assert_eq!(row(&t, "Board total").current, "25.00 A");
         assert_eq!(row(&t, "Fan 2").current, "1010 RPM");
         assert_eq!(row(&t, "Memory junction").current, "40.0 °C");
-        assert_eq!(t.sensor_count(), t.rows().iter().filter(|r| !r.is_header).count());
         assert!(striped(&t));
     }
 
@@ -636,7 +710,7 @@ mod tests {
         assert!(at("HUBCLK") < at("DISPCLK"));
         assert!(at("DISPCLK") < at("L2CLK"));
         assert!(at("L2CLK") < at("Reference clock"));
-        assert!(at("Reference clock") < at("Domain type 31"));
+        assert!(!names.iter().any(|n| n.starts_with("Domain type")), "an unnamed domain gets no row");
         assert_eq!(at("SYS") + 1, at("HUBCLK"), "domains follow the named clocks");
     }
 
@@ -649,9 +723,55 @@ mod tests {
     }
 
     #[test]
+    fn memory_chips_stand_as_one_hottest_row() {
+        let chips = |a0: f64, b2: f64| GpuTelemetry {
+            supplemental_sensors: vec![
+                sup("nv:memchip-a0", "Memory chip A0", "°C", a0),
+                sup("nv:memchip-b2", "Memory chip B2", "°C", b2),
+            ],
+            memory_temperature_c: 56.0,
+            ..empty()
+        };
+        let mut t = TelemetryTable::new(&chips(54.0, 58.0), &GpuCapabilities::default(), []);
+        t.add(&chips(54.0, 58.0), None);
+        let names: Vec<&str> = t.rows().iter().map(|r| r.name.as_str()).collect();
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(at("Memory junction") < at("Memory chips (hottest)"));
+        assert!(at("Memory chips (hottest)") < at("Memory chip A0"), "stands ahead of the chips it covers");
+        assert_eq!(group_of(&t, "Memory chips (hottest)"), "TEMPERATURES");
+        assert_eq!(row(&t, "Memory chips (hottest)").current, "58.0 °C · B2");
+        // The hottest moves to another chip; the statistics follow the hottest figure.
+        t.add(&chips(60.0, 57.0), None);
+        let r = row(&t, "Memory chips (hottest)");
+        assert_eq!(
+            (r.current.as_str(), r.minimum.as_str(), r.maximum.as_str()),
+            ("60.0 °C · A0", "58.0 °C", "60.0 °C")
+        );
+        assert!(is_memory_chip_key("nv:memchip-a0") && !is_memory_chip_key(HOTTEST_CHIP_KEY));
+        // A card without chip sensors gets no such row.
+        let plain = TelemetryTable::new(&empty(), &GpuCapabilities::default(), []);
+        assert!(!plain.rows().iter().any(|r| r.name == "Memory chips (hottest)"));
+    }
+
+    #[test]
+    fn pcie_link_reads_as_generation_and_width() {
+        assert_eq!(format_reading(5.0, "gen", 0), "Gen 5");
+        assert_eq!(format_reading(16.0, "lanes", 0), "x16");
+        assert_eq!(format_reading(32.0, "GT/s", 1), "32.0 GT/s");
+    }
+
+    #[test]
     fn names_match_the_backend() {
-        assert_eq!(domain_name(31), "Domain type 31");
+        assert_eq!(domain_name(31), None);
+        assert_eq!(domain_name(20), Some("L2CLK"));
         assert_eq!(power_rail_name(0, 7), "Board total");
+        assert_eq!(power_rail_name(2, 7), "Power connector 12 V");
+        assert_eq!(power_rail_name(3, 7), "GPU rails (NVVDD + other)");
+        assert_eq!(power_rail_name(5, 7), "Other GPU rail input");
+        #[cfg(windows)]
+        for i in 0..7 {
+            assert_eq!(power_rail_name(i, 7), roch_nvidia::power_rail_name(i as i32, 7), "same name as the backend");
+        }
         assert_eq!(power_rail_name(0, 3), "Rail 0");
     }
 }
