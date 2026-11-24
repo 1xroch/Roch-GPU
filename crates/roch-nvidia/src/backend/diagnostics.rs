@@ -174,6 +174,23 @@ impl NvidiaBackend {
                         two_dp(r.value_ma as f64 / 1000.0)
                     );
                 }
+                // What a write is actually checked against on R615+.
+                match private::read_modern_ocp_windows(g) {
+                    Some(ws) => {
+                        for (rail, w) in ["NVVDD", "MSVDD"].iter().zip(ws) {
+                            let _ = writeln!(
+                                sb,
+                                "    modern {rail}: {} .. {} A, default {} A",
+                                two_dp(w.min_ma as f64 / 1000.0),
+                                two_dp(w.max_ma as f64 / 1000.0),
+                                two_dp(w.default_ma as f64 / 1000.0)
+                            );
+                        }
+                    }
+                    None => {
+                        let _ = writeln!(sb, "    modern windows: not available");
+                    }
+                }
                 Ok(())
             }),
         );

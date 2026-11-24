@@ -62,6 +62,44 @@ fn valid(b: &[u8]) -> bool {
         && rd_i32(b, value(14)) > 0
 }
 
+/// One rail's window in the modern (R615+) range payload, in milliamps: the bounds
+/// [`modern_apply`] enforces, so anything offering a value to write should offer these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModernWindow {
+    pub min_ma: i32,
+    pub default_ma: i32,
+    pub max_ma: i32,
+}
+
+impl ModernWindow {
+    pub fn is_sane(&self) -> bool {
+        self.min_ma > 0 && self.min_ma <= self.default_ma && self.default_ma <= self.max_ma
+    }
+}
+
+/// Fill the modern range payload with `info` (the driver's range getter). `Err` is its status.
+pub fn read_modern_ranges(mut info: impl FnMut(&mut [u8]) -> i32) -> Result<Vec<u8>, i32> {
+    let mut ranges = vec![0u8; RANGE_SIZE];
+    wr_i32(&mut ranges, 0, RANGE_SIZE as i32);
+    match info(&mut ranges) {
+        0 => Ok(ranges),
+        status => Err(status),
+    }
+}
+
+/// The window for `slot` (13 NVVDD, 14 MSVDD), or `None` when the payload is not the known layout.
+pub fn modern_window(ranges: &[u8], slot: i32) -> Option<ModernWindow> {
+    let at = 0x4B0 + slot as usize * 0x296C;
+    if ranges.len() < at + 0x18 || rd_i32(ranges, 0) != RANGE_SIZE as i32 || rd_i32(ranges, at) != 19 {
+        return None;
+    }
+    Some(ModernWindow {
+        min_ma: rd_i32(ranges, at + 0xC),
+        default_ma: rd_i32(ranges, at + 0x10),
+        max_ma: rd_i32(ranges, at + 0x14),
+    })
+}
+
 /// `ModernOcpControl.Apply`. `get`/`info`/`set` call the driver on the given buffer and return its
 /// status. `None` on success, else the reason.
 pub fn modern_apply(
@@ -89,22 +127,20 @@ pub fn modern_apply(
     let other_slot = if slot == 13 { 14 } else { 13 };
     let other = rd_i32(&control, value(other_slot));
 
-    let mut ranges = vec![0u8; RANGE_SIZE];
-    wr_i32(&mut ranges, 0, RANGE_SIZE as i32);
-    let status = info(&mut ranges);
-    if status != 0 {
-        return Some(format!("Reading modern OCP bounds: status {status}; no write attempted."));
-    }
-    let at = 0x4B0 + slot as usize * 0x296C;
-    if rd_i32(&ranges, 0) != RANGE_SIZE as i32 || rd_i32(&ranges, at) != 19 {
+    let ranges = match read_modern_ranges(&mut info) {
+        Ok(r) => r,
+        Err(status) => return Some(format!("Reading modern OCP bounds: status {status}; no write attempted.")),
+    };
+    let Some(w) = modern_window(&ranges, slot) else {
         return Some("Modern OCP range layout/rail validation failed; no write attempted.".into());
-    }
-    let min = rd_i32(&ranges, at + 0xC);
-    let def = rd_i32(&ranges, at + 0x10);
-    let max = rd_i32(&ranges, at + 0x14);
-    if min <= 0 || min > def || def > max || current < min || current > max || requested_ma < min || requested_ma > max
-    {
-        return Some("OCP request or metadata is outside the driver-reported bounds; no write attempted.".into());
+    };
+    if !w.is_sane() || current < w.min_ma || current > w.max_ma || requested_ma < w.min_ma || requested_ma > w.max_ma {
+        return Some(format!(
+            "OCP request {} A is outside the driver-reported bounds ({} … {} A); no write attempted.",
+            requested_ma / 1000,
+            w.min_ma / 1000,
+            w.max_ma / 1000
+        ));
     }
 
     // Preserve the full getter payload; modify only the selected output-current field.

@@ -93,7 +93,12 @@ impl NvidiaBackend {
             return Ok(());
         }
 
-        let lo = MIN_LOCKABLE_MHZ.max(if min_mhz > 0 { min_mhz } else { MIN_LOCKABLE_MHZ });
+        // The floor the driver reported, which the slider offers (180 MHz on a 5070 Ti, and it
+        // accepts it); 210 only for a card that reports none. Raising every floor to 210 here moved
+        // a 180-209 MHz floor without a word.
+        let floor =
+            self.caps_cache.get(&gpu).map(|c| c.clock_lock_min_mhz).filter(|&m| m > 0).unwrap_or(MIN_LOCKABLE_MHZ);
+        let lo = floor.max(if min_mhz > 0 { min_mhz } else { floor });
         let mut hi = if max_mhz > 0 { max_mhz } else { min_mhz };
         if hi < lo {
             hi = lo;

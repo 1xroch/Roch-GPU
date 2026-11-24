@@ -201,7 +201,12 @@ impl NvidiaBackend {
         let ocp_msvdd = slot_value(private::OCP_SLOT_MSVDD);
         let can_ocp = ocp_nvvdd > 0 && ocp_msvdd > 0;
         let ranges = private::read_ocp_ranges(g);
-        let (nv_r, ms_r) = (private::range_for(&ranges, ocp_nvvdd), private::range_for(&ranges, ocp_msvdd));
+        // On R615+ a write is checked against a second, modern window; offer only what passes both.
+        let modern = if can_ocp { private::read_modern_ocp_windows(g) } else { None };
+        let (nv_lo, nv_hi) =
+            private::offered_ocp_window(private::range_for(&ranges, ocp_nvvdd), ocp_nvvdd, modern.map(|[nv, _]| nv));
+        let (ms_lo, ms_hi) =
+            private::offered_ocp_window(private::range_for(&ranges, ocp_msvdd), ocp_msvdd, modern.map(|[_, ms]| ms));
 
         // Clock lock. NVML owns it; its reported maximum is the top of the range and its minimum the
         // floor (the 210 MHz fallback only when the driver reports none).
@@ -265,10 +270,10 @@ impl NvidiaBackend {
             can_set_ocp: can_ocp,
             nvvdd_ocp_stock_milliamps: ocp_nvvdd,
             msvdd_ocp_stock_milliamps: ocp_msvdd,
-            nvvdd_ocp_min_milliamps: nv_r.map(|r| r.min_ma).unwrap_or(0),
-            nvvdd_ocp_max_milliamps: nv_r.map(|r| r.max_ma).unwrap_or(0),
-            msvdd_ocp_min_milliamps: ms_r.map(|r| r.min_ma).unwrap_or(0),
-            msvdd_ocp_max_milliamps: ms_r.map(|r| r.max_ma).unwrap_or(0),
+            nvvdd_ocp_min_milliamps: nv_lo,
+            nvvdd_ocp_max_milliamps: nv_hi,
+            msvdd_ocp_min_milliamps: ms_lo,
+            msvdd_ocp_max_milliamps: ms_hi,
             msvdd_rail_min_mv: msvdd.min_mv,
             msvdd_rail_max_mv: msvdd.max_mv,
             msvdd_rail_stock_max_mv: msvdd.stock_mv,

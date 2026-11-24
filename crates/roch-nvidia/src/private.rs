@@ -1388,6 +1388,36 @@ pub fn read_ocp_ranges(h: GpuHandle) -> Vec<OcpRange> {
     parse_ocp_ranges(&w)
 }
 
+/// The modern (R615+) OCP windows for NVVDD and MSVDD — what a write on these drivers is checked
+/// against. `None` on older drivers, or when the payload is not the known layout or not sane.
+pub fn read_modern_ocp_windows(h: GpuHandle) -> Option<[ocp::ModernWindow; 2]> {
+    if nvapi::driver_version().unwrap_or(0) < 61500 {
+        return None;
+    }
+    let ranges = ocp::read_modern_ranges(|d| call_ocp_buffer(h, FN_OCP_GET_RANGES, d)).ok()?;
+    let nv = ocp::modern_window(&ranges, OCP_SLOT_NVVDD).filter(ocp::ModernWindow::is_sane)?;
+    let ms = ocp::modern_window(&ranges, OCP_SLOT_MSVDD).filter(ocp::ModernWindow::is_sane)?;
+    Some([nv, ms])
+}
+
+/// The window to offer for one OCP rail, in mA, as `(min, max)`: the driver's range for it (or
+/// half to one and a half times the stock limit where it lists none), narrowed to the modern window
+/// a write on R615+ is checked against — so the slider never offers a value the write refuses. A
+/// 5070 Ti on 621.24 reports 250..350 A for NVVDD and nothing for MSVDD, yet its modern windows stop
+/// at the stock 300 A and 120 A. `(0, 0)` (no modern window, no range) leaves the caller to derive one.
+pub fn offered_ocp_window(range: Option<OcpRange>, stock_ma: i32, modern: Option<ocp::ModernWindow>) -> (i32, i32) {
+    let listed = range.map(|r| (r.min_ma, r.max_ma));
+    let Some(w) = modern else { return listed.unwrap_or((0, 0)) };
+    let (lo, hi) = listed.unwrap_or((stock_ma / 2, stock_ma.saturating_mul(3) / 2));
+    let (lo, hi) = (lo.max(w.min_ma), hi.min(w.max_ma));
+    if lo > 0 && lo <= stock_ma && stock_ma <= hi {
+        (lo, hi)
+    } else {
+        // The two disagree about where stock sits: offer nothing to move.
+        (stock_ma, stock_ma)
+    }
+}
+
 /// `RangeFor`: the tightest range offered for a channel currently at `limit_ma`.
 ///
 /// A limit can appear in more than one entry — a 5070 Ti's core one shows as 250000..350000 and as
@@ -2328,6 +2358,20 @@ mod tests {
             OcpRange { min_ma: 250_000, value_ma: 300_000, max_ma: 350_000 },
         ];
         assert_eq!(range_for(&two, 300_000), Some(two[1]), "narrowest wins");
+    }
+
+    #[test]
+    fn ocp_slider_stops_where_the_modern_write_does() {
+        let w = |min_ma, max_ma| ocp::ModernWindow { min_ma, default_ma: max_ma, max_ma };
+        let nv = Some(OcpRange { min_ma: 250_000, value_ma: 300_000, max_ma: 350_000 });
+        // 5070 Ti on 621.24: NVVDD lists 250..350 but the write stops at 300; MSVDD lists nothing.
+        assert_eq!(offered_ocp_window(nv, 300_000, Some(w(1, 300_000))), (250_000, 300_000));
+        assert_eq!(offered_ocp_window(None, 120_000, Some(w(1, 120_000))), (60_000, 120_000));
+        // Older drivers (no modern window) keep what they had.
+        assert_eq!(offered_ocp_window(nv, 300_000, None), (250_000, 350_000));
+        assert_eq!(offered_ocp_window(None, 120_000, None), (0, 0));
+        // A modern window that excludes stock offers nothing to move.
+        assert_eq!(offered_ocp_window(None, 120_000, Some(w(1, 100_000))), (120_000, 120_000));
     }
 
     #[test]
