@@ -445,6 +445,9 @@ impl GpuBackend for MockBackend {
         }
         self.lock_lo = min_mhz;
         self.lock_hi = max_mhz;
+        // As on an RTX 5070 Ti: the clock lock takes over from a voltage cap, and releasing it does
+        // not bring the cap back. Whoever writes the range has to put the cap back after it.
+        self.volt_lock_mv = 0;
         Ok(())
     }
 

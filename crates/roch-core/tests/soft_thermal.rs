@@ -509,3 +509,40 @@ fn a_refused_gpu_switch_keeps_the_limit_running() {
     assert!(svc.soft_thermal_status().active, "nothing switched, nothing released");
     assert_eq!(p.range(), held);
 }
+
+#[test]
+fn a_boost_lock_voltage_cap_survives_the_ceiling() {
+    let (svc, p) = rig();
+    // A 950 mV cap the driver holds itself (its boost lock, no clock lock behind it). Writing the
+    // clock range drops it, as on an RTX 5070 Ti, so the controller has to put it back each time.
+    svc.apply(&TuningProfile { target_voltage_mv: 950, ..limit(60) });
+    assert_eq!(svc.read_voltage_lock_mv(), 950);
+    until_holding(&svc, &p);
+    assert_eq!(svc.read_voltage_lock_mv(), 950, "written again after the ceiling");
+    ticks(&svc, &p, 30);
+    assert_eq!(svc.read_voltage_lock_mv(), 950, "and after every move of it");
+    svc.release_soft_thermal_limit();
+    assert_eq!(p.range(), (0, 0));
+    assert_eq!(svc.read_voltage_lock_mv(), 950, "and after the release");
+}
+
+#[test]
+fn the_cap_survives_every_hold_not_just_the_first() {
+    let (svc, p) = rig();
+    svc.apply(&TuningProfile { target_voltage_mv: 950, ..limit(60) });
+    for round in 0..3 {
+        p.m(|m| m.fixed_load = Some(100.0));
+        until_holding(&svc, &p);
+        assert_eq!(svc.read_voltage_lock_mv(), 950, "hold {round}: the cap is written back after the ceiling");
+        // Cool off until the controller lets go mid-run.
+        p.m(|m| m.fixed_load = Some(10.0));
+        for _ in 0..300 {
+            tick(&svc, &p);
+            if !svc.soft_thermal_status().active {
+                break;
+            }
+        }
+        assert!(!svc.soft_thermal_status().active, "hold {round} let go");
+        assert_eq!(svc.read_voltage_lock_mv(), 950, "release {round}: the cap is put back");
+    }
+}

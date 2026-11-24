@@ -48,8 +48,8 @@ use std::time::{Duration, Instant};
 use crate::backend::GpuBackend;
 use crate::models::voltage_plan;
 use crate::models::*;
-use crate::services::TelemetryHistory;
 use crate::services::soft_thermal::{self, Confirmed, SoftThermalController, ThermalAction, ThermalBounds};
+use crate::services::{LeversOnCard, TelemetryHistory};
 use crate::util::{clamp_i32, round_even_i32};
 use crate::{GpuError, NOTE_PREFIX, Result};
 
@@ -277,11 +277,11 @@ impl ThermalRun {
 /// The window the thermal controller works in: the card's lockable range, inside the user's own
 /// Clock Range when that lever is on the card, and under a voltage cap's clock lock it took over.
 fn thermal_bounds(st: &EngineState, voltage_cap_mhz: i32) -> ThermalBounds {
-    let user = if st.armed_on_card.has(XocLever::CLOCK_RANGE) {
-        st.applied.as_ref().map(|a| (a.clock_lock_min_mhz, a.clock_lock_max_mhz))
-    } else {
-        None
-    };
+    // The range written to the card, which is also there for one taken over from an earlier run.
+    let user = st
+        .armed_on_card
+        .has(XocLever::CLOCK_RANGE)
+        .then_some((st.levers_written.clock_lock_min_mhz, st.levers_written.clock_lock_max_mhz));
     ThermalBounds::new(st.caps.clock_lock_min_mhz, st.caps.clock_lock_max_mhz, user, voltage_cap_mhz)
 }
 
@@ -290,6 +290,9 @@ fn thermal_bounds(st: &EngineState, voltage_cap_mhz: i32) -> ThermalBounds {
 fn thermal_restore(drv: &mut Driver, gpu: usize, b: &ThermalBounds, restore_voltage_cap: bool) -> Result<()> {
     drv.backend.set_clock_range(gpu, b.restore.0, b.restore.1)?;
     let cap = drv.thermal.voltage_cap.take();
+    // The next hold looks for the cap again: it is back on the card now, and a hold that started
+    // without it remembered would drop it for good (each hold after the first did).
+    drv.thermal.voltage_cap_checked = false;
     if restore_voltage_cap && let Some((mv, _)) = cap.filter(|(mv, _)| *mv > 0) {
         drv.backend.set_voltage_lock(gpu, mv)?;
     }
@@ -329,6 +332,10 @@ struct EngineState {
     caps: GpuCapabilities,
     applied: Option<TuningProfile>,
     armed_on_card: XocLever,
+    /// The values behind `armed_on_card`: what each lever's last successful write put on the card
+    /// (or what a lever taken over from an earlier run was recorded with). The record a new run
+    /// reads is built from this, never from the editor, which can hold values not yet written.
+    levers_written: TuningProfile,
     latest: Option<GpuTelemetry>,
     observed_max_voltage_mv: i32,
     observed_max_boosted_voltage_mv: i32,
@@ -353,6 +360,7 @@ impl EngineState {
             caps: GpuCapabilities::default(),
             applied: None,
             armed_on_card: XocLever::NONE,
+            levers_written: TuningProfile::default(),
             latest: None,
             observed_max_voltage_mv: 0,
             observed_max_boosted_voltage_mv: 0,
@@ -528,6 +536,11 @@ impl EngineState {
         }
         if c.can_lock_memory_clock {
             l |= XocLever::MEMORY_CLOCK;
+        }
+        // Left out, the OCP limits were written but never counted as on the card: the XOC window
+        // said "Press Apply to send them" for limits already live, and a restart lost them.
+        if c.can_set_ocp {
+            l |= XocLever::NVVDD_OCP | XocLever::MSVDD_OCP;
         }
         l
     }
@@ -713,58 +726,73 @@ fn write_xoc(
 ) {
     let on = p.xoc_armed;
     let was_on = st.armed_on_card;
-    // Recorded here because every lever write goes through this routine. Masked by what the card
-    // can do, so a profile asking for a domain this GPU has not got cannot report itself live.
-    st.armed_on_card = (st.armed_on_card & !which) | (on & which & st.supported_levers());
-    let c = &st.caps;
+    let supported = st.supported_levers();
+    let c = st.caps.clone();
+    // Every lever write goes through here, so this is where the card's levers are recorded: each one
+    // follows its own write. Armed once its write lands, off once its restore lands (or there was
+    // nothing of ours to restore); a write that fails leaves the record as it was, because the card
+    // is still as it was. A lever this card has not got is never recorded.
+    let mut landed: Vec<(XocLever, bool)> = Vec::new();
 
     if which.has(XocLever::NVVDD) && c.can_set_voltage_rail {
         let armed = on.has(XocLever::NVVDD);
         let restore = !armed && (force_restore_disarmed || was_on.has(XocLever::NVVDD));
+        let mut ok = true;
         if armed {
+            // Armed counts once any part landed: half a rail on the card still needs a Disable to
+            // put it back, so it must not be recorded as off.
+            let mut any = false;
             if p.voltage_rail_max_mv > 0 {
-                t.run("Core rail ceiling", b.set_voltage_rail_max(gpu, p.voltage_rail_max_mv));
+                any |= t.run("Core rail ceiling", b.set_voltage_rail_max(gpu, p.voltage_rail_max_mv));
             }
-            t.run("Core rail floor", b.set_voltage_rail_floor(gpu, p.voltage_rail_floor_mv));
+            any |= t.run("Core rail floor", b.set_voltage_rail_floor(gpu, p.voltage_rail_floor_mv));
+            ok = any;
         } else if restore {
             // A default we never saw is left alone rather than guessed at (guessing low browns the
             // card out). Floors have a real default of zero offset, unlike ceilings.
             if st.nvvdd_default_max_mv > 0 {
-                t.run("Core rail ceiling", b.set_voltage_rail_max(gpu, st.nvvdd_default_max_mv));
+                ok &= t.run("Core rail ceiling", b.set_voltage_rail_max(gpu, st.nvvdd_default_max_mv));
             }
-            t.run("Core rail floor", b.set_voltage_rail_floor(gpu, 0));
+            ok &= t.run("Core rail floor", b.set_voltage_rail_floor(gpu, 0));
         }
+        landed.push((XocLever::NVVDD, ok));
     }
 
     if which.has(XocLever::MSVDD) && c.can_set_msvdd_rail {
         let armed = on.has(XocLever::MSVDD);
         let restore = !armed && (force_restore_disarmed || was_on.has(XocLever::MSVDD));
+        let mut ok = true;
         if armed {
+            // Armed counts once any part landed: half a rail on the card still needs a Disable to
+            // put it back, so it must not be recorded as off.
+            let mut any = false;
             if p.msvdd_rail_max_mv > 0 {
-                t.run("MSVDD ceiling", b.set_msvdd_rail_max(gpu, p.msvdd_rail_max_mv));
+                any |= t.run("MSVDD ceiling", b.set_msvdd_rail_max(gpu, p.msvdd_rail_max_mv));
             }
-            t.run("MSVDD floor", b.set_msvdd_rail_floor(gpu, p.msvdd_rail_floor_mv));
+            any |= t.run("MSVDD floor", b.set_msvdd_rail_floor(gpu, p.msvdd_rail_floor_mv));
+            ok = any;
         } else if restore {
             if st.msvdd_default_max_mv > 0 {
-                t.run("MSVDD ceiling", b.set_msvdd_rail_max(gpu, st.msvdd_default_max_mv));
+                ok &= t.run("MSVDD ceiling", b.set_msvdd_rail_max(gpu, st.msvdd_default_max_mv));
             }
-            t.run("MSVDD floor", b.set_msvdd_rail_floor(gpu, 0));
+            ok &= t.run("MSVDD floor", b.set_msvdd_rail_floor(gpu, 0));
         }
+        landed.push((XocLever::MSVDD, ok));
     }
 
     if which.has(XocLever::XBAR) && c.can_set_xbar_offset {
         let mhz = if on.has(XocLever::XBAR) { p.xbar_offset_mhz } else { 0 };
-        t.run("Crossbar offset", b.set_xbar_offset(gpu, mhz));
+        landed.push((XocLever::XBAR, t.run("Crossbar offset", b.set_xbar_offset(gpu, mhz))));
     }
 
     if which.has(XocLever::SYS) && c.can_set_sys_offset {
         let mhz = if on.has(XocLever::SYS) { p.sys_offset_mhz } else { 0 };
-        t.run("SYS clock offset", b.set_sys_offset(gpu, mhz));
+        landed.push((XocLever::SYS, t.run("SYS clock offset", b.set_sys_offset(gpu, mhz))));
     }
 
     if which.has(XocLever::VIDEO) && c.can_set_video_offset {
         let mhz = if on.has(XocLever::VIDEO) { p.video_offset_mhz } else { 0 };
-        t.run("Video clock offset", b.set_video_offset(gpu, mhz));
+        landed.push((XocLever::VIDEO, t.run("Video clock offset", b.set_video_offset(gpu, mhz))));
     }
 
     // Disarmed restores the stock limit rather than leaving whatever was last written: an OCP limit
@@ -776,9 +804,8 @@ fn write_xoc(
         } else {
             st.nvvdd_ocp_default_ma
         };
-        if ma > 0 {
-            t.run("NVVDD OCP limit", b.set_nvvdd_ocp_milliamps(gpu, ma));
-        }
+        let ok = ma <= 0 || t.run("NVVDD OCP limit", b.set_nvvdd_ocp_milliamps(gpu, ma));
+        landed.push((XocLever::NVVDD_OCP, ok));
     }
 
     if which.has(XocLever::MSVDD_OCP) && c.can_set_ocp {
@@ -787,16 +814,15 @@ fn write_xoc(
         } else {
             st.msvdd_ocp_default_ma
         };
-        if ma > 0 {
-            t.run("MSVDD OCP limit", b.set_msvdd_ocp_milliamps(gpu, ma));
-        }
+        let ok = ma <= 0 || t.run("MSVDD OCP limit", b.set_msvdd_ocp_milliamps(gpu, ma));
+        landed.push((XocLever::MSVDD_OCP, ok));
     }
 
     if which.has(XocLever::CLOCK_RANGE) && c.can_lock_clocks {
         // 0/0 hands the range back to the driver, which is exactly what disarmed means here.
         let armed = on.has(XocLever::CLOCK_RANGE);
         let (lo, hi) = if armed { (p.clock_lock_min_mhz, p.clock_lock_max_mhz) } else { (0, 0) };
-        t.run("Core clock range", b.set_clock_range(gpu, lo, hi));
+        landed.push((XocLever::CLOCK_RANGE, t.run("Core clock range", b.set_clock_range(gpu, lo, hi))));
     }
 
     if which.has(XocLever::MEMORY_CLOCK) && c.can_lock_memory_clock {
@@ -804,13 +830,60 @@ fn write_xoc(
         // or on Reset (a lock from an earlier run outlives it), so a plain Apply never touches it.
         // A side left at 0 is the end of what the card can hold.
         let (min, max) = (p.memory_clock_lock_min_mhz, p.memory_clock_lock_max_mhz);
+        let mut ok = true;
         if on.has(XocLever::MEMORY_CLOCK) && (min > 0 || max > 0) {
             let hi = if max > 0 { max } else { c.memory_lock_max_mhz };
             let lo = (if min > 0 { min } else { c.memory_lock_min_mhz }).min(hi);
-            t.run("Memory clock range", b.set_memory_lock(gpu, lo, hi));
+            ok = t.run("Memory clock range", b.set_memory_lock(gpu, lo, hi));
         } else if force_restore_disarmed || was_on.has(XocLever::MEMORY_CLOCK) {
-            t.run("Memory clock range", b.set_memory_lock(gpu, 0, 0));
+            ok = t.run("Memory clock range", b.set_memory_lock(gpu, 0, 0));
         }
+        landed.push((XocLever::MEMORY_CLOCK, ok));
+    }
+
+    // A lever asked for that this card cannot do is never on it.
+    st.armed_on_card = XocLever(st.armed_on_card.0 & !(which.0 & !supported.0));
+    for (lever, ok) in landed {
+        if !ok {
+            continue;
+        }
+        let armed = on.has(lever) && supported.has(lever);
+        st.armed_on_card = st.armed_on_card.with(lever, armed);
+        if armed {
+            copy_lever_values(lever, p, &mut st.levers_written);
+        }
+    }
+}
+
+/// Copy one lever's values from `from` to `to` (the profile fields that lever writes).
+fn copy_lever_values(lever: XocLever, from: &TuningProfile, to: &mut TuningProfile) {
+    if lever.has(XocLever::NVVDD) {
+        (to.voltage_rail_max_mv, to.voltage_rail_floor_mv) = (from.voltage_rail_max_mv, from.voltage_rail_floor_mv);
+    }
+    if lever.has(XocLever::MSVDD) {
+        (to.msvdd_rail_max_mv, to.msvdd_rail_floor_mv) = (from.msvdd_rail_max_mv, from.msvdd_rail_floor_mv);
+    }
+    if lever.has(XocLever::XBAR) {
+        to.xbar_offset_mhz = from.xbar_offset_mhz;
+    }
+    if lever.has(XocLever::SYS) {
+        to.sys_offset_mhz = from.sys_offset_mhz;
+    }
+    if lever.has(XocLever::VIDEO) {
+        to.video_offset_mhz = from.video_offset_mhz;
+    }
+    if lever.has(XocLever::NVVDD_OCP) {
+        to.nvvdd_ocp_milliamps = from.nvvdd_ocp_milliamps;
+    }
+    if lever.has(XocLever::MSVDD_OCP) {
+        to.msvdd_ocp_milliamps = from.msvdd_ocp_milliamps;
+    }
+    if lever.has(XocLever::CLOCK_RANGE) {
+        (to.clock_lock_min_mhz, to.clock_lock_max_mhz) = (from.clock_lock_min_mhz, from.clock_lock_max_mhz);
+    }
+    if lever.has(XocLever::MEMORY_CLOCK) {
+        (to.memory_clock_lock_min_mhz, to.memory_clock_lock_max_mhz) =
+            (from.memory_clock_lock_min_mhz, from.memory_clock_lock_max_mhz);
     }
 }
 
@@ -965,11 +1038,14 @@ impl Inner {
             }
             // A voltage cap held through the same clock lock is a ceiling too: the controller works
             // under it, and puts it back when it lets go.
+            // A cap held by the driver's own boost lock (no clock, mhz 0) is remembered too: writing
+            // the clock range drops it (seen on an RTX 5070 Ti), so it is written again after each
+            // ceiling and put back on release.
             if !drv.thermal.voltage_cap_checked {
                 drv.thermal.voltage_cap_checked = true;
                 let mhz = drv.backend.voltage_cap_clock_mhz(gpu);
-                if mhz > 0 {
-                    let mv = drv.backend.read_voltage_lock_mv(gpu);
+                let mv = drv.backend.read_voltage_lock_mv(gpu);
+                if mhz > 0 || mv > 0 {
                     drv.thermal.voltage_cap = Some((mv, mhz));
                 }
             }
@@ -985,7 +1061,22 @@ impl Inner {
             let action = drv.thermal.ctl.step(limit, temp, clock, &b);
             let result = match action {
                 ThermalAction::None => None,
-                ThermalAction::Cap { min_mhz, max_mhz } => Some(drv.backend.set_clock_range(gpu, min_mhz, max_mhz)),
+                ThermalAction::Cap { min_mhz, max_mhz } => {
+                    let r = drv.backend.set_clock_range(gpu, min_mhz, max_mhz);
+                    // A boost-lock cap the range write just dropped goes back on. Its own failure is
+                    // reported apart: the ceiling landed, and counting it failed would back off.
+                    if r.is_ok()
+                        && let Some((mv, 0)) = drv.thermal.voltage_cap
+                        && mv > 0
+                        && let Err(e) = drv.backend.set_voltage_lock(gpu, mv)
+                    {
+                        logs.push(format!(
+                            "Thermal limit: the {mv} mV voltage cap could not be written again: {}",
+                            e.message
+                        ));
+                    }
+                    Some(r)
+                }
                 ThermalAction::Release { .. } => Some(thermal_restore(drv, gpu, &b, true)),
             };
             if let Some(r) = result {
@@ -1243,6 +1334,11 @@ impl TuningService {
             st.thermal_status = drv.thermal.status();
             self.inner.gpu_index.store(index, Ordering::SeqCst);
             st.caps = drv.backend.capabilities(index)?;
+            // What was applied, and which levers are on, belonged to the card just left: carried over,
+            // the new card was shown its predecessor's settings and its record was written with them.
+            st.applied = None;
+            st.armed_on_card = XocLever::NONE;
+            st.levers_written = TuningProfile::default();
             self.inner.history.clear();
             // Do not show the previous card's last reading while the first new sample is pending.
             st.latest = None;
@@ -1335,13 +1431,24 @@ impl TuningService {
     /// Take over levers an earlier run left on the card (see `LeversOnCard`), so this run treats
     /// them as its own: reported live, and released when disarmed rather than left standing. Only
     /// before this run has written anything; returns what was taken over.
-    pub fn adopt_levers_on_card(&self, levers: XocLever) -> XocLever {
+    pub fn adopt_levers_on_card(&self, record: &LeversOnCard, levers: XocLever) -> XocLever {
         let mut st = self.state();
         if st.applied.is_some() || !st.armed_on_card.is_empty() {
             return XocLever::NONE;
         }
-        st.armed_on_card = levers & st.supported_levers();
-        st.armed_on_card
+        let adopted = levers & record.levers() & st.supported_levers();
+        st.armed_on_card = adopted;
+        record.fill(adopted, &mut st.levers_written);
+        adopted
+    }
+
+    /// What this service has on the card, for the next run to take over: the gated levers it wrote
+    /// (or took over), with the values that landed. `None` when nothing is on. The main clock
+    /// offsets (XBAR, SYS, video) are left out, since every Apply writes them anyway.
+    pub fn levers_on_card_record(&self, boot_unix_s: i64) -> Option<LeversOnCard> {
+        let st = self.state();
+        let levers = st.armed_on_card & !(XocLever::XBAR | XocLever::SYS | XocLever::VIDEO);
+        (!levers.is_empty()).then(|| LeversOnCard::new(levers, &st.levers_written, boot_unix_s))
     }
 
     /// Latest foreground telemetry sample.
@@ -1797,7 +1904,23 @@ impl TuningService {
                 a.run("Voltage boost (rail restore complete)", drv.backend.set_voltage_boost(gpu, restore_boost));
             }
         } else {
+            // Writing the core clock range replaces a voltage cap: on an RTX 5070 Ti the NVML clock
+            // lock took over from the 950 mV boost lock (1020 mV, 3082 MHz), and releasing the range
+            // left the cap gone. Apply writes the cap last for this reason; a lever must too.
+            let recap = lever.has(XocLever::CLOCK_RANGE)
+                && st.caps.can_lock_clocks
+                && st.caps.voltage_style == VoltageControlStyle::Absolute;
+            let cap_mv = if recap { drv.backend.read_voltage_lock_mv(gpu) } else { 0 };
             write_xoc(drv.backend.as_mut(), gpu, st, &p, &mut a, lever, false);
+            if cap_mv > 0 && a.run("Voltage cap", drv.backend.set_voltage_lock(gpu, cap_mv)) {
+                let got = drv.backend.read_voltage_lock_mv(gpu);
+                let mechanism = drv.backend.voltage_lock_mechanism();
+                a.log(format!("Voltage lock read-back: {got} mV (asked {cap_mv} mV) via {mechanism}"));
+                st.voltage_lock_mechanism = mechanism;
+                if got >= 0 && (got - cap_mv).abs() > 10 {
+                    a.errors.push(format!("Core voltage: asked for {cap_mv} mV, card reports {got} mV."));
+                }
+            }
         }
         if lever.has(XocLever::CLOCK_RANGE) && st.caps.can_lock_clocks {
             // The lever just wrote the user's range over any thermal ceiling (and, on NVIDIA, over a

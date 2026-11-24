@@ -290,6 +290,9 @@ pub struct MainViewModel {
     /// Fan edits apart from the rest: the fan window's own Apply writes these and clears only them.
     pending_fan_changes: bool,
     loading_editor: bool,
+    /// The values a lever had when it was disarmed, put back when it is armed again: disarming shows
+    /// the driver's own values (a full range for the clock locks), and arming those pinned nothing.
+    disarmed_values: Vec<(XocLever, Vec<(Field, i32)>)>,
 
     telemetry: Option<GpuTelemetry>,
     last_ceiling: i32,
@@ -343,6 +346,7 @@ impl MainViewModel {
             pending_changes: false,
             pending_fan_changes: false,
             loading_editor: false,
+            disarmed_values: Vec::new(),
             telemetry: None,
             last_ceiling: 0,
             last_boost_ceiling: 0,
@@ -424,7 +428,7 @@ impl MainViewModel {
         {
             match svc.read_tuning_state() {
                 Ok(live) => {
-                    let adopted = svc.adopt_levers_on_card(rec.still_on_card(&live, boot_time_unix_s()));
+                    let adopted = svc.adopt_levers_on_card(rec, rec.still_on_card(&live, boot_time_unix_s()));
                     vm.show_levers_on_card(adopted, rec);
                 }
                 Err(_) => record_unchecked = true,
@@ -1341,11 +1345,16 @@ impl MainViewModel {
             (XocLever::XBAR, "XBAR"),
             (XocLever::SYS, "SYS"),
             (XocLever::VIDEO, "video"),
+            (XocLever::NVVDD_OCP, "NVVDD OCP"),
+            (XocLever::MSVDD_OCP, "MSVDD OCP"),
             (XocLever::CLOCK_RANGE, "core clock range"),
             (XocLever::MEMORY_CLOCK, "memory clock"),
         ] {
             if self.xoc_armed.has(lever) {
-                names.push(name);
+                // A range armed at its full width pins nothing; saying it is live would claim a lock.
+                let unpinned = (lever == XocLever::CLOCK_RANGE && self.clock_lock_is_off())
+                    || (lever == XocLever::MEMORY_CLOCK && self.memory_lock_is_off());
+                names.push(if unpinned { format!("{name} (full range, nothing pinned)") } else { name.to_string() });
             }
         }
         // What an earlier session left on the card: rail ceilings outlive the process that set them.
@@ -2165,6 +2174,8 @@ impl MainViewModel {
     }
 
     pub fn load_into_editor(&mut self, p: &TuningProfile) {
+        // A profile's own values win over any a lever had before it was disarmed.
+        self.disarmed_values.clear();
         self.loading_editor = true;
         let c = self.caps.clone();
         self.set(Field::CoreOffset, p.core_offset_mhz);
@@ -2248,14 +2259,12 @@ impl MainViewModel {
         self.xoc_armed = XocLever(self.xoc_armed.0 | (levers.0 & !self.main_clock_levers().0));
     }
 
-    /// Record which gated levers are on the card now, with their values, for the next run (see
-    /// `LeversOnCard`). Called after every driver job that can move a lever.
+    /// Record which gated levers are on the card now, with the values that landed, for the next run
+    /// (see `LeversOnCard`). Called after every driver job that can move a lever. The service keeps
+    /// what was written; the editor may hold edits not yet sent, which must not be recorded as live.
     fn remember_levers_on_card(&mut self) {
-        let levers = XocLever(self.shared.service.armed_on_card().0 & !self.main_clock_levers().0);
         let name = self.device.name.clone();
-        let record = (!levers.is_empty()).then(|| {
-            LeversOnCard::new(levers, &self.build_profile_from_editor(&name), boot_time_unix_s().unwrap_or(0))
-        });
+        let record = self.shared.service.levers_on_card_record(boot_time_unix_s().unwrap_or(0));
         let changed = {
             let mut s = self.shared.settings();
             match record {
@@ -2299,6 +2308,15 @@ impl MainViewModel {
     }
 
     pub fn set_lever(&mut self, lever: XocLever, on: bool) {
+        if on && let Some(i) = self.disarmed_values.iter().position(|(l, _)| *l == lever) {
+            // Putting back what the card had is not an unapplied edit: Enable writes it at once.
+            let (_, values) = self.disarmed_values.remove(i);
+            let (pending, pending_fans) = (self.pending_changes, self.pending_fan_changes);
+            for (f, v) in values {
+                self.set(f, v);
+            }
+            (self.pending_changes, self.pending_fan_changes) = (pending, pending_fans);
+        }
         let p = self.build_profile_from_editor(self.selected_profile.as_deref().unwrap_or("Session"));
         self.queue(Job::new(if on { "Arming…" } else { "Disarming…" }, move |sh: &Shared| {
             let errors = sh.service.set_xoc_lever(&p, lever, on);
@@ -2412,6 +2430,9 @@ impl MainViewModel {
                         self.set_status(errors.join("  |  "));
                     }
                     self.mark_clean();
+                    // The profile just applied says what each lever holds now; values remembered
+                    // from before a Disable must not be written over it by a later Enable.
+                    self.disarmed_values.clear();
                     // Disabled rail editors show the driver-owned live ceilings; the boost can
                     // move them, so do not leave startup values on screen.
                     self.refresh_driver_owned_rail_ceilings(&readback.state);
@@ -2457,6 +2478,9 @@ impl MainViewModel {
                 };
                 self.status_is_error = !success;
                 if !on && success {
+                    let values: Vec<(Field, i32)> = lever_fields(lever).iter().map(|&f| (f, self.get(f))).collect();
+                    self.disarmed_values.retain(|(l, _)| *l != lever);
+                    self.disarmed_values.push((lever, values));
                     self.show_disarmed_values(lever, &readback.state);
                 }
                 self.applied_summary = self.build_applied_summary(&readback);
@@ -2488,6 +2512,19 @@ impl MainViewModel {
         if moves_levers {
             self.remember_levers_on_card();
         }
+    }
+}
+
+/// The editor fields one lever writes, which Disable replaces with the driver's own values.
+fn lever_fields(lever: XocLever) -> &'static [Field] {
+    match lever {
+        XocLever::NVVDD => &[Field::VoltageRailMax, Field::VoltageRailFloor],
+        XocLever::MSVDD => &[Field::MsvddRailMax, Field::MsvddRailFloor],
+        XocLever::NVVDD_OCP => &[Field::NvvddOcpAmps],
+        XocLever::MSVDD_OCP => &[Field::MsvddOcpAmps],
+        XocLever::CLOCK_RANGE => &[Field::ClockLockMin, Field::ClockLockMax],
+        XocLever::MEMORY_CLOCK => &[Field::MemoryLockMin, Field::MemoryLockMax],
+        _ => &[],
     }
 }
 

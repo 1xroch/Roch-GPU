@@ -77,6 +77,11 @@ impl ModernWindow {
     }
 }
 
+/// Milliamps as amps for a message: whole where it is ("120"), else to a tenth ("125.5").
+fn amps(ma: i32) -> String {
+    if ma % 1000 == 0 { (ma / 1000).to_string() } else { format!("{:.1}", ma as f64 / 1000.0) }
+}
+
 /// Fill the modern range payload with `info` (the driver's range getter). `Err` is its status.
 pub fn read_modern_ranges(mut info: impl FnMut(&mut [u8]) -> i32) -> Result<Vec<u8>, i32> {
     let mut ranges = vec![0u8; RANGE_SIZE];
@@ -137,9 +142,9 @@ pub fn modern_apply(
     if !w.is_sane() || current < w.min_ma || current > w.max_ma || requested_ma < w.min_ma || requested_ma > w.max_ma {
         return Some(format!(
             "OCP request {} A is outside the driver-reported bounds ({} … {} A); no write attempted.",
-            requested_ma / 1000,
-            w.min_ma / 1000,
-            w.max_ma / 1000
+            amps(requested_ma),
+            amps(w.min_ma),
+            amps(w.max_ma)
         ));
     }
 

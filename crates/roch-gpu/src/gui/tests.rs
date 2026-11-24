@@ -996,3 +996,80 @@ fn levers_left_on_the_card_survive_a_relaunch() {
     again.run_jobs_inline();
     assert!(shared.settings().levers_on_card_by_gpu.is_empty(), "Reset leaves nothing on the card");
 }
+
+/// Disable shows the driver's own values; Enable straight after puts back the ones the lever had,
+/// rather than arming the full range (which pinned nothing while the window said "Live").
+#[test]
+fn enable_after_disable_restores_the_lever_values() {
+    let f = fixture();
+    let mut vm = vm(&f);
+    let lo = vm.caps.memory_lock_min_mhz;
+    vm.set(Field::MemoryLockMin, lo);
+    vm.set(Field::MemoryLockMax, lo);
+    vm.set_lever(XocLever::MEMORY_CLOCK, true);
+    vm.run_jobs_inline();
+    let lock = || f.shared.service.with_backend(|b| b.as_mock().unwrap().memory_lock);
+    assert_eq!(lock(), (lo, lo));
+
+    vm.set_lever(XocLever::MEMORY_CLOCK, false);
+    vm.run_jobs_inline();
+    assert_eq!(lock(), (0, 0));
+    assert!(vm.memory_lock_is_off(), "disarmed, the window shows the driver's full range");
+
+    vm.set_lever(XocLever::MEMORY_CLOCK, true);
+    vm.run_jobs_inline();
+    assert_eq!(lock(), (lo, lo), "Enable puts the lock back");
+    assert_eq!((vm.get(Field::MemoryLockMin), vm.get(Field::MemoryLockMax)), (lo, lo));
+    assert_eq!(vm.xoc_status_text(), "Live on the card: memory clock.");
+
+    // A profile loaded in between wins over the remembered values.
+    vm.set_lever(XocLever::MEMORY_CLOCK, false);
+    vm.run_jobs_inline();
+    vm.load_into_editor(&TuningProfile::stock(&vm.caps, None));
+    vm.set_lever(XocLever::MEMORY_CLOCK, true);
+    vm.run_jobs_inline();
+    assert!(vm.memory_lock_is_off(), "the profile's full range, not the old lock");
+    assert!(vm.xoc_status_text().contains("memory clock (full range, nothing pinned)"), "{}", vm.xoc_status_text());
+}
+
+/// The OCP levers are named in the XOC status, and live once written.
+#[test]
+fn ocp_levers_show_as_live() {
+    let f = fixture();
+    let mut vm = vm(&f);
+    let below = vm.bounds(Field::NvvddOcpAmps).0;
+    vm.set(Field::NvvddOcpAmps, below);
+    vm.set_lever(XocLever::NVVDD_OCP, true);
+    vm.run_jobs_inline();
+    assert_eq!(vm.xoc_status_text(), "Live on the card: NVVDD OCP.");
+    assert_eq!(f.shared.service.read_tuning_state().unwrap().nvvdd_ocp_milliamps, below * 1000, "the value landed");
+}
+
+/// The record keeps what was written: an armed range moved on screen but not sent is not live, and
+/// switching to another card carries none of this one's levers to it.
+#[test]
+fn the_record_holds_what_was_written_not_what_is_on_screen() {
+    let f = multi_fixture();
+    let mut vm = vm(&f);
+    let lo = vm.caps.memory_lock_min_mhz;
+    vm.set(Field::MemoryLockMin, lo);
+    vm.set(Field::MemoryLockMax, lo);
+    vm.set_lever(XocLever::MEMORY_CLOCK, true);
+    vm.run_jobs_inline();
+    let next = *vm.caps.memory_lock_clocks_mhz.get(1).expect("a second lockable clock");
+    vm.set(Field::MemoryLockMax, next);
+    vm.set_lever(XocLever::NVVDD_OCP, true);
+    vm.run_jobs_inline();
+    let name = vm.device.name.clone();
+    let rec = f.shared.settings().levers_on_card_by_gpu.get(&name).cloned().expect("recorded");
+    assert_eq!((rec.memory_clock_lock_min_mhz, rec.memory_clock_lock_max_mhz), (lo, lo), "the unsent edit is not live");
+    assert!(rec.levers().has(XocLever::NVVDD_OCP) && rec.levers().has(XocLever::MEMORY_CLOCK));
+
+    vm.switch_gpu(1).unwrap();
+    assert!(f.shared.service.armed_on_card().is_empty(), "the other card starts with nothing on it");
+    assert_eq!(vm.xoc_status_text(), "Nothing armed - the card is running the driver's own values.");
+    let other = vm.device.name.clone();
+    assert_ne!(other, name);
+    assert!(!f.shared.settings().levers_on_card_by_gpu.contains_key(&other), "nothing recorded for it");
+    assert!(f.shared.settings().levers_on_card_by_gpu.contains_key(&name), "the first card's record is kept");
+}

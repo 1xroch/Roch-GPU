@@ -1306,3 +1306,76 @@ fn manual_curve_overwrite_is_noted() {
     assert!(only_notes(&errs) && errs[0].contains("hand-edited V/F curve"), "{errs:?}");
     assert!(!svc.manual_curve_active());
 }
+
+/// Writing the core clock range on its own (the XOC lever) must leave a voltage cap in place: on an
+/// RTX 5070 Ti the clock lock took over from the 950 mV cap, and releasing the range did not bring
+/// it back. The mock drops the cap on a range write, as that card did.
+#[test]
+fn clock_range_lever_keeps_the_voltage_cap() {
+    let svc = new_svc();
+    let errs = svc.apply(&TuningProfile { target_voltage_mv: 950, ..profile() });
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(svc.read_voltage_lock_mv(), 950);
+
+    let ranged =
+        TuningProfile { target_voltage_mv: 950, clock_lock_min_mhz: 300, clock_lock_max_mhz: 2500, ..profile() };
+    let errs = svc.set_xoc_lever(&ranged, XocLever::CLOCK_RANGE, true);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(mock(&svc, |m| m.clock_range_writes.last().copied()), Some((300, 2500)), "the range landed");
+    assert_eq!(svc.read_voltage_lock_mv(), 950, "the cap is put back after arming the range");
+    let c = calls(&svc);
+    assert!(last_index(&c, "SetVoltageLock") >= 0, "the cap was rewritten: {c:?}");
+
+    let errs = svc.set_xoc_lever(&ranged, XocLever::CLOCK_RANGE, false);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(mock(&svc, |m| m.clock_range_writes.last().copied()), Some((0, 0)), "the range is released");
+    assert_eq!(svc.read_voltage_lock_mv(), 950, "and the cap survives that too");
+
+    // No cap, nothing to put back.
+    let plain = new_svc();
+    plain.apply(&profile());
+    mock(&plain, |m| m.calls.clear());
+    plain.set_xoc_lever(&ranged, XocLever::CLOCK_RANGE, true);
+    assert!(!has_call(&plain, "SetVoltageLock"), "no cap was set, so none is written");
+}
+
+/// The OCP limits count as levers on the card once written, like every other lever.
+#[test]
+fn ocp_levers_are_recorded_as_live() {
+    let svc = new_svc();
+    let p = TuningProfile { msvdd_ocp_milliamps: 110_000, ..profile() };
+    let errs = svc.set_xoc_lever(&p, XocLever::MSVDD_OCP, true);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(svc.armed_on_card().has(XocLever::MSVDD_OCP), "an armed OCP limit is live on the card");
+    svc.set_xoc_lever(&p, XocLever::MSVDD_OCP, false);
+    assert!(!svc.armed_on_card().has(XocLever::MSVDD_OCP));
+}
+
+/// The record of what is on the card follows each write: values that landed, not ones asked for
+/// that failed, and nothing carried from one card to another.
+#[test]
+fn the_lever_record_follows_what_landed() {
+    let svc = new_svc();
+    let p = TuningProfile { clock_lock_min_mhz: 300, clock_lock_max_mhz: 2500, ..profile() };
+    svc.set_xoc_lever(&p, XocLever::CLOCK_RANGE, true);
+    let rec = svc.levers_on_card_record(7).expect("a range is on the card");
+    assert!(rec.levers().has(XocLever::CLOCK_RANGE));
+    assert_eq!((rec.clock_lock_min_mhz, rec.clock_lock_max_mhz, rec.boot_unix_s), (300, 2500, 7));
+
+    // A new range that fails to land leaves the old one recorded, as it is still on the card.
+    mock(&svc, |m| m.fail_clock_range = true);
+    let errs = svc.set_xoc_lever(&TuningProfile { clock_lock_max_mhz: 2000, ..p.clone() }, XocLever::CLOCK_RANGE, true);
+    assert!(!errs.is_empty());
+    let rec = svc.levers_on_card_record(7).unwrap();
+    assert_eq!(rec.clock_lock_max_mhz, 2500, "the failed write is not recorded");
+    // A release that fails leaves it recorded as on.
+    svc.set_xoc_lever(&p, XocLever::CLOCK_RANGE, false);
+    assert!(svc.armed_on_card().has(XocLever::CLOCK_RANGE), "still on the card, so still recorded");
+    mock(&svc, |m| m.fail_clock_range = false);
+    svc.set_xoc_lever(&p, XocLever::CLOCK_RANGE, false);
+    assert!(svc.levers_on_card_record(7).is_none(), "released, nothing left to record");
+
+    // The main clock offsets are written by every Apply and are not part of the record.
+    svc.apply(&TuningProfile { xoc_armed: XocLever::XBAR, xbar_offset_mhz: 60, ..profile() });
+    assert!(svc.levers_on_card_record(7).is_none());
+}
