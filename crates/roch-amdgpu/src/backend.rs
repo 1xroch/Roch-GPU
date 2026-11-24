@@ -360,9 +360,45 @@ impl AmdgpuBackend {
         Some((value? != 0, range.is_some()))
     }
 
-    fn write_zero_rpm(&mut self, path: &Path, enabled: bool) -> Result<()> {
-        self.write(path, if enabled { "1\n" } else { "0\n" })?;
-        self.write(path, "c\n")
+    fn write_zero_rpm(&mut self, gpu: usize, enabled: bool) -> Result<()> {
+        let path = self.card(gpu)?.attr(ZERO_RPM_FILE);
+        self.restage_fans(gpu, true, false)?;
+        self.write(&path, if enabled { "1\n" } else { "0\n" })?;
+        self.write(&path, "c\n")
+    }
+
+    /// Stages the card's fan settings again, ahead of a commit. On RDNA 3 the driver sends the
+    /// firmware only the features edited since the last commit, and the firmware puts any feature it
+    /// is not sent back to stock: measured on an RX 7900 XT under kernel 7.2, a voltage offset commit
+    /// on its own stopped fans held at a fixed 50 %, and a fan curve commit on its own turned Zero
+    /// RPM back on. Writing the current values again marks them edited, so they ride along. Only
+    /// what differs from stock is staged: a curve the user set, and Zero RPM turned off.
+    fn restage_fans(&mut self, gpu: usize, curve: bool, zero_rpm: bool) -> Result<()> {
+        if curve
+            && let Some(table) = self.read_fan_curve(gpu)
+            && table.mode() != FanTableMode::Auto
+            && table.is_writable()
+        {
+            let path = self.card(gpu)?.attr(FAN_CURVE_FILE);
+            for (i, &(t, s)) in table.points.iter().enumerate() {
+                self.write(&path, &format!("{i} {t} {s}\n"))?;
+            }
+        }
+        if zero_rpm && self.read_zero_rpm(gpu) == Some((false, true)) {
+            let path = self.card(gpu)?.attr(ZERO_RPM_FILE);
+            self.write(&path, "0\n")?;
+        }
+        Ok(())
+    }
+
+    /// Turns Zero RPM off for certain. The switch can read off while the firmware still stops the
+    /// fans: at boot, or after a commit that did not carry it on a driver that sends only what was
+    /// edited. The driver skips a commit that changes nothing, so the switch goes on for one commit
+    /// and off for the next, which the fans are too slow to notice.
+    fn force_zero_rpm_off(&mut self, gpu: usize) -> Result<()> {
+        let rearm = self.write_zero_rpm(gpu, true);
+        self.write_zero_rpm(gpu, false)?;
+        rearm
     }
 
     /// `ip_discovery` exists from Navi 1x on, so a card without it is an older one.
@@ -461,6 +497,7 @@ impl AmdgpuBackend {
                 return Err(first);
             }
         }
+        self.restage_fans(gpu, true, true)?;
         self.write(&path, "c\n")
     }
 
@@ -472,6 +509,7 @@ impl AmdgpuBackend {
         for (i, t, s) in od::plan_fan_curve(speed_at, table.points.len(), temp, speed) {
             self.write(&path, &format!("{i} {t} {s}\n"))?;
         }
+        self.restage_fans(gpu, false, true)?;
         self.write(&path, "c\n")
     }
 
@@ -1009,17 +1047,16 @@ impl GpuBackend for AmdgpuBackend {
         let Some((on, true)) = self.read_zero_rpm(gpu) else {
             bail!("This card does not expose zero RPM control.");
         };
-        let card = self.card(gpu)?;
-        let needs_refresh = !on && !enabled && card.hw_i64("fan1_input") == Some(0);
-        if on == enabled && !needs_refresh {
-            return Ok(());
+        // Off is always sent: reading off does not mean the firmware has it off (see
+        // force_zero_rpm_off), and a fan that is turning now may still be stopped later.
+        if enabled {
+            if on {
+                return Ok(());
+            }
+            self.write_zero_rpm(gpu, true)?;
+        } else {
+            self.force_zero_rpm_off(gpu)?;
         }
-        let path = card.attr(ZERO_RPM_FILE);
-        // The driver can cache "off" while the firmware still stops the fans. The driver skips
-        // an unchanged commit, so briefly re-arm the switch to make the next commit reach it.
-        let refresh = if needs_refresh { self.write_zero_rpm(&path, true) } else { Ok(()) };
-        self.write_zero_rpm(&path, enabled)?;
-        refresh?;
         if self.read_zero_rpm(gpu).map(|(on, _)| on) != Some(enabled) {
             bail!("The driver did not confirm the Zero RPM setting.");
         }
@@ -1069,7 +1106,13 @@ impl GpuBackend for AmdgpuBackend {
                 // ones that wait to be told.
                 let path = self.card(gpu)?.attr(FAN_CURVE_FILE);
                 self.write(&path, "r\n")?;
-                self.write(&path, "c\n")
+                self.write(&path, "c\n")?;
+                // The restore's own commit does not carry Zero RPM, so the firmware may have put it
+                // back on; what the user set stays set.
+                if self.read_zero_rpm(gpu) == Some((false, true)) {
+                    self.force_zero_rpm_off(gpu)?;
+                }
+                Ok(())
             }
             FanControl::Pwm => {
                 let Some(enable) = self.card(gpu)?.hw("pwm1_enable") else { return Ok(()) };

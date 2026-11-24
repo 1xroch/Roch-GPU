@@ -302,7 +302,24 @@ impl AttrWriter for KernelSim {
         if !path.exists() {
             return Err(io::Error::from_raw_os_error(2));
         }
-        match file.as_str() {
+        // The driver keeps one staged table per card, so a commit through any of its files sends
+        // what was staged through the others too.
+        if value.trim() == "c" && [OD_FILE, "fan_curve", "fan_zero_rpm_enable"].contains(&file.as_str()) {
+            let device = if file == OD_FILE { path.parent() } else { path.ancestors().nth(3) }.unwrap();
+            for staged in [OD_FILE, FAN_CURVE_FILE, ZERO_RPM_FILE].map(|f| device.join(f)) {
+                if staged != path && sim.pending.contains_key(&staged) {
+                    let name = staged.file_name().unwrap().to_string_lossy().into_owned();
+                    Self::apply(sim, &staged, &name, value)?;
+                }
+            }
+        }
+        Self::apply(sim, path, &file, value)
+    }
+}
+
+impl KernelSim {
+    fn apply(sim: &mut Sim, path: &Path, file: &str, value: &str) -> io::Result<()> {
+        match file {
             "pp_od_clk_voltage" => {
                 let reset = if fs::read_to_string(path)?.contains("OD_SCLK_OFFSET") { OD_RDNA4 } else { OD_RDNA3 };
                 Self::write_od(sim, path, value, reset)
@@ -877,11 +894,22 @@ fn a_fixed_duty_is_a_flat_curve_and_leaves_zero_rpm_alone_as_on_windows() {
     b.set_fan_speed(0, -1, 5).unwrap();
     assert_eq!(b.read_tuning_state(0).unwrap().fan_percent, 23);
 
-    // Back to auto restores the curve and nothing else.
+    // Back to auto restores the curve and nothing else: Zero RPM, which the restore's commit did
+    // not carry, is sent off again.
     b.set_zero_rpm(0, false).unwrap();
     sim.0.lock().unwrap().log.clear();
     b.set_fan_auto(0).unwrap();
-    assert_eq!(sim.log(), ["fan_curve r", "fan_curve c"]);
+    assert_eq!(
+        sim.log(),
+        [
+            "fan_curve r",
+            "fan_curve c",
+            "fan_zero_rpm_enable 1",
+            "fan_zero_rpm_enable c",
+            "fan_zero_rpm_enable 0",
+            "fan_zero_rpm_enable c",
+        ]
+    );
     let s = b.read_tuning_state(0).unwrap();
     assert_eq!(s.detected_fan_mode, Some(FanMode::Auto));
     assert!(!s.fan_manual);
@@ -917,26 +945,74 @@ fn zero_rpm_is_written_and_committed() {
     assert!(!b.read_tuning_state(0).unwrap().zero_rpm);
     b.set_zero_rpm(0, true).unwrap();
     assert!(b.read_tuning_state(0).unwrap().zero_rpm);
-    assert_eq!(sim.log().len(), 4);
+    assert_eq!(sim.log().len(), 6, "off is a re-arm and a release, on is one write: {:?}", sim.log());
 }
 
+/// Reading off does not mean the firmware has it off: at boot, or after a commit that did not
+/// carry it, the fans stop all the same. So off is always sent, re-armed first because the driver
+/// skips a commit that changes nothing, whether or not the fan is turning right now.
 #[test]
-fn disabling_zero_rpm_again_refreshes_the_setting_if_the_fan_is_stopped() {
+fn disabling_zero_rpm_always_reaches_the_firmware() {
     let (tree, device) = rdna3("zero-refresh");
     let (mut b, sim) = backend(&tree);
     b.set_zero_rpm(0, false).unwrap();
-    let writes = sim.log().len();
+    let off = ["fan_zero_rpm_enable 1", "fan_zero_rpm_enable c", "fan_zero_rpm_enable 0", "fan_zero_rpm_enable c"];
+    assert_eq!(sim.log(), off);
 
-    b.set_zero_rpm(0, false).unwrap();
-    assert_eq!(sim.log().len(), writes, "a spinning fan does not need a refresh");
+    for rpm in ["1200\n", "0\n"] {
+        fs::write(device.join("hwmon/hwmon3/fan1_input"), rpm).unwrap();
+        sim.0.lock().unwrap().log.clear();
+        b.set_zero_rpm(0, false).unwrap();
+        assert_eq!(sim.log(), off);
+        assert!(!b.read_tuning_state(0).unwrap().zero_rpm);
+    }
+}
 
-    fs::write(device.join("hwmon/hwmon3/fan1_input"), "0\n").unwrap();
+/// On an RX 7900 XT under kernel 7.2 the firmware puts back to stock every fan feature a commit
+/// does not carry: a voltage offset alone stopped fans held at 50 %, and a curve alone turned Zero
+/// RPM back on. So each commit stages the fan settings that differ from stock again.
+#[test]
+fn every_commit_carries_the_fan_settings() {
+    let (tree, device) = rdna3("fan-restage");
+    let (mut b, sim) = backend(&tree);
+
+    // Stock fans: nothing extra is staged.
+    b.set_voltage_curve_offset(0, -30, 0).unwrap();
+    assert_eq!(sim.log(), ["pp_od_clk_voltage vo -30", "pp_od_clk_voltage c"]);
+
+    // A curve commit carries Zero RPM off.
     b.set_zero_rpm(0, false).unwrap();
+    sim.0.lock().unwrap().log.clear();
+    b.set_fan_speed(0, -1, 50).unwrap();
+    assert_eq!(sim.log()[5..], ["fan_zero_rpm_enable 0", "fan_curve c"]);
+
+    // A clock or voltage commit carries both.
+    sim.0.lock().unwrap().log.clear();
+    b.set_voltage_curve_offset(0, -50, 0).unwrap();
     assert_eq!(
-        sim.log()[writes..],
-        ["fan_zero_rpm_enable 1", "fan_zero_rpm_enable c", "fan_zero_rpm_enable 0", "fan_zero_rpm_enable c"]
+        sim.log(),
+        [
+            "pp_od_clk_voltage vo -50",
+            "fan_curve 0 25 50",
+            "fan_curve 1 43 50",
+            "fan_curve 2 62 50",
+            "fan_curve 3 81 50",
+            "fan_curve 4 100 50",
+            "fan_zero_rpm_enable 0",
+            "pp_od_clk_voltage c",
+        ]
     );
-    assert!(!b.read_tuning_state(0).unwrap().zero_rpm);
+
+    // A Zero RPM commit carries the curve.
+    sim.0.lock().unwrap().log.clear();
+    b.set_zero_rpm(0, true).unwrap();
+    assert_eq!(sim.log()[5..], ["fan_zero_rpm_enable 1", "fan_zero_rpm_enable c"]);
+
+    // One staged table: the commit through one file leaves nothing pending in the others.
+    assert_eq!(sim.pending(), 0);
+    let s = b.read_tuning_state(0).unwrap();
+    assert_eq!((s.voltage_offset_mv, s.fan_percent, s.zero_rpm), (-50, 50, true));
+    assert!(fs::read_to_string(device.join(FAN_CURVE_FILE)).unwrap().contains("4: 100C 50%"));
 }
 
 #[test]
