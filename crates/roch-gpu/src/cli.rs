@@ -8,7 +8,7 @@
 //!   RochGPU.exe apply-profile <name> [--gpu 0]     apply a saved GUI profile
 //!   RochGPU.exe list-profiles
 //!   RochGPU.exe reset [--gpu 0]
-//!   RochGPU.exe startup --enable <profile> | --disable | --status
+//!   RochGPU.exe startup --enable <profile> [--gpu 0] | --disable | --status
 //!   add --mock anywhere to use the simulated GPU (--mock rtx50: one without a hardware temp limit;
 //!   --mock multi: a two-card machine)
 //! ```
@@ -20,7 +20,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use roch_core::services::startup_task;
-use roch_core::services::{AppSettings, ProfileStore, ServiceEvent, TuningService};
+use roch_core::services::{AppSettings, ProfileRecovery, ProfileStore, ServiceEvent, TuningService};
 use roch_core::{FanMode, GpuError, GpuTelemetry, NOTE_PREFIX, TuningProfile, VoltageControlStyle, XocLever};
 
 use crate::{backends, console};
@@ -106,7 +106,7 @@ fn dispatch(
 
     let backend = if mock { backends::mock_variant(opts.get("mock")) } else { backends::create_and_initialize()?.0 };
     crate::trace!("cli: backend detected ({})", backend.backend_name());
-    let svc = TuningService::new(backend);
+    let svc = std::sync::Arc::new(TuningService::new(backend));
     let store = ProfileStore::new(store_root)?;
 
     match args[0].to_lowercase().as_str() {
@@ -164,7 +164,7 @@ fn dispatch(
             }
             Ok(0)
         }
-        "startup" => startup(opts, out, err),
+        "startup" => startup(&svc, &store, opts, out, err),
         _ => {
             usage(out);
             Ok(2)
@@ -816,7 +816,13 @@ pub fn report(errs: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 
     1
 }
 
-fn startup(o: &Opts, out: &mut dyn Write, err: &mut dyn Write) -> CliResult<i32> {
+fn startup(
+    svc: &std::sync::Arc<TuningService>,
+    store: &ProfileStore,
+    o: &Opts,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<i32> {
     if !startup_task::is_supported() {
         outln!(err, "Not supported on this platform.");
         return Ok(1);
@@ -838,16 +844,71 @@ fn startup(o: &Opts, out: &mut dyn Write, err: &mut dyn Write) -> CliResult<i32>
         } else {
             startup_task::register(&exe.to_string_lossy(), prof)?;
             outln!(out, "Startup entry registered: apply '{prof}' at logon.");
-            outln!(
-                out,
-                "{NOTE_PREFIX} a profile only runs at logon once it has been confirmed: tick Startup for it in the \
-                 window. Without `rochgpu setup` the apply is refused; either way the reason is in the log."
-            );
         }
-        return Ok(0);
+        return confirm_for_startup(svc, store, prof, o.get("gpu"), out, err);
     }
     outln!(err, "use --enable <profile> | --disable | --status");
     Ok(2)
+}
+
+/// What ticking Startup in the window does, for every card (or the one `--gpu` names): apply the
+/// saved profile as a journalled trial, and approve the confirmed result to run at logon. A card
+/// only runs a startup profile its own journal approved, so on a machine with two cards both need
+/// this; one whose trial fails is left as it was and reported.
+fn confirm_for_startup(
+    svc: &std::sync::Arc<TuningService>,
+    store: &ProfileStore,
+    name: &str,
+    only: Option<&str>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<i32> {
+    let Some(profile) = store.load(name)? else {
+        outln!(err, "Profile '{name}' not found in {}", store.profiles_directory().display());
+        return Ok(2);
+    };
+    svc.initialize_preferred(0)?;
+    let count = svc.devices().len();
+    let cards: Vec<usize> = match only {
+        Some(index) => match index.trim().parse::<usize>() {
+            Ok(index) if index < count => vec![index],
+            _ => return Err(CliError::BadGpuIndex),
+        },
+        None => (0..count).collect(),
+    };
+    let mut failed = false;
+    for index in cards {
+        start(svc, store, index)?;
+        let device = svc.device();
+        let card = format!("GPU {} ({}, {})", index, device.name, device.bus_id);
+        let mut recovery = match ProfileRecovery::for_selected(store.root_directory(), svc) {
+            Ok(recovery) => recovery,
+            Err(e) => {
+                outln!(err, "{card}: the recovery journal cannot be read ({}); nothing applied.", e.message);
+                failed = true;
+                continue;
+            }
+        };
+        if recovery.has_pending() {
+            outln!(
+                err,
+                "{card}: an interrupted trial is waiting to be recovered; open Roch GPU once, then run this again."
+            );
+            failed = true;
+            continue;
+        }
+        let mut candidate = profile.clone_profile();
+        candidate.clamp_to(&svc.capabilities());
+        let messages = recovery.trial(&candidate);
+        if !messages.is_empty() && !roch_core::only_notes(&messages) {
+            outln!(err, "{card}: '{name}' was not confirmed: {}", messages.join("; "));
+            failed = true;
+            continue;
+        }
+        recovery.approve_startup(name)?;
+        outln!(out, "{card}: '{name}' applied and confirmed to run at logon.");
+    }
+    Ok(i32::from(failed))
 }
 
 // ------------------------------------------------------------------ domains (NVIDIA only)
@@ -1078,7 +1139,9 @@ RochGPU.exe — Roch GPU command line / undervolt CLI (needs admin for writes)
   RochGPU.exe list-profiles
   RochGPU.exe reset [--gpu 0]
   RochGPU.exe diag                       dump everything the driver reports (for bug reports)
-  RochGPU.exe startup --enable <profile> | --disable | --status
+  RochGPU.exe startup --enable <profile> [--gpu 0] | --disable | --status
+                                     --enable applies the profile to every card (or the one --gpu names)
+                                     as a trial and confirms it to run at logon, as ticking Startup does
   (add --mock to any command to use a simulated GPU; --mock rtx50 for one without a hardware temp limit;
    --mock multi for a two-card machine)";
 

@@ -117,81 +117,39 @@ pub fn start(
 
     let mut shared = Shared::new(service.clone(), store, settings, startup);
 
-    // Recover BEFORE processing a logon profile so a crashed trial cannot be replayed at boot.
-    let mut notice = None;
-    let mut recovered_trial = false;
-    match shared.open_recovery() {
-        Ok(mut recovery) => {
-            if recovery.has_pending() {
-                recovered_trial = true;
-                let errors = recovery.revert();
-                let text = if errors.is_empty() || only_notes(&errors) {
-                    "Recovered interrupted profile trial. Startup apply was skipped.".to_string()
-                } else {
-                    format!("Profile recovery failed: {}", errors.join("; "))
-                };
-                log(&text);
-                notice = Some(text);
-            }
-            shared.set_recovery(Some(recovery));
+    // Recover BEFORE processing a logon profile so a crashed trial cannot be replayed at boot. A
+    // logon apply then goes to every card, each through its own journal: a machine with two cards
+    // tuned alike wants both tuned at logon, and each card's approval is its own. The selected card
+    // goes last, so the journal the window keeps is that card's.
+    let selected = service.gpu_index();
+    let cards: Vec<usize> = match &apply_profile {
+        Some(_) => (0..count).filter(|index| *index != selected).chain(std::iter::once(selected)).collect(),
+        None => vec![selected],
+    };
+    let mut notices: Vec<String> = Vec::new();
+    for index in cards {
+        if index != service.gpu_index()
+            && let Err(e) = service.select_gpu(index)
+        {
+            log(&format!("Could not select GPU {} for the startup profile: {}", index + 1, e.message));
+            continue;
         }
-        Err(e) => {
-            let text = format!("Profile recovery unavailable: {}", e.message);
-            log(&text);
-            notice = Some(text);
-            recovered_trial = true;
+        let label = if count > 1 {
+            let device = service.device();
+            format!(" on {} ({})", device.name, device.bus_id)
+        } else {
+            String::new()
+        };
+        let outcome = recover_and_apply(&shared, apply_profile.as_deref(), &label, count > 1, &log);
+        if outcome.recovered && index == selected {
+            apply_profile = None;
         }
+        notices.extend(outcome.notice);
     }
-    if recovered_trial {
-        apply_profile = None;
+    if !notices.is_empty() {
         minimized = false;
     }
-
-    if let Some(name) = apply_profile {
-        let confirmed = shared.recovery().as_ref().and_then(|r| r.startup_profile(&name));
-        match confirmed {
-            None => {
-                let text = format!("Confirm '{name}' using the Startup checkbox before it can run at logon.");
-                log(&text);
-                notice = Some(text);
-                minimized = false;
-            }
-            Some(p) => {
-                let mut guard = shared.recovery();
-                if let Some(recovery) = guard.as_mut() {
-                    match recovery.begin(&p) {
-                        Ok(errs) if errs.is_empty() || only_notes(&errs) => match recovery.confirm() {
-                            Ok(()) => log(&format!("Confirmed startup profile '{name}' applied.")),
-                            Err(e) => {
-                                let text = format!("Startup recovery interrupted: {}", e.message);
-                                log(&text);
-                                notice = Some(text);
-                                minimized = false;
-                            }
-                        },
-                        Ok(errs) => {
-                            let rollback = recovery.revert();
-                            let tail = if recovery.has_pending() {
-                                format!(" Recovery failed: {}", rollback.join("; "))
-                            } else {
-                                " — restored fallback profile.".to_string()
-                            };
-                            let text = format!("Startup apply failed: {}{tail}", errs.join("; "));
-                            log(&text);
-                            notice = Some(text);
-                            minimized = false;
-                        }
-                        Err(e) => {
-                            let text = format!("Startup recovery interrupted: {}", e.message);
-                            log(&text);
-                            notice = Some(text);
-                            minimized = false;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let notice = (!notices.is_empty()).then(|| notices.join("\n"));
 
     if flags.exit_after {
         // A fan curve cannot survive without a resident process; the startup docs say so.
@@ -207,12 +165,159 @@ pub fn start(
     Started::Window { shared, minimized }
 }
 
+/// What recovering one card, and applying the logon profile to it, came to.
+struct CardOutcome {
+    /// An interrupted trial was found (or the journal could not be read): nothing was applied.
+    recovered: bool,
+    notice: Option<String>,
+}
+
+/// Recover the selected card's journal, then apply the confirmed startup profile `name` to it.
+/// `label` names the card in messages on a machine with more than one.
+fn recover_and_apply(
+    shared: &Shared,
+    name: Option<&str>,
+    label: &str,
+    several: bool,
+    log: &dyn Fn(&str),
+) -> CardOutcome {
+    let mut notice = None;
+    let mut recovered = false;
+    match shared.open_recovery() {
+        Ok(mut recovery) => {
+            if recovery.has_pending() {
+                recovered = true;
+                let errors = recovery.revert();
+                let text = if errors.is_empty() || only_notes(&errors) {
+                    format!("Recovered interrupted profile trial{label}. Startup apply was skipped.")
+                } else {
+                    format!("Profile recovery failed{label}: {}", errors.join("; "))
+                };
+                log(&text);
+                notice = Some(text);
+            }
+            shared.set_recovery(Some(recovery));
+        }
+        Err(e) => {
+            let text = format!("Profile recovery unavailable{label}: {}", e.message);
+            log(&text);
+            notice = Some(text);
+            recovered = true;
+        }
+    }
+    let Some(name) = name.filter(|_| !recovered) else {
+        return CardOutcome { recovered, notice };
+    };
+    let confirmed = shared.recovery().as_ref().and_then(|r| r.startup_profile(name));
+    let Some(profile) = confirmed else {
+        let how = if several {
+            format!(
+                " Select that card and tick Startup, or run `rochgpu startup --enable \"{name}\"` to confirm it on every card."
+            )
+        } else {
+            String::new()
+        };
+        let text = format!("Confirm '{name}' using the Startup checkbox before it can run at logon{label}.{how}");
+        log(&text);
+        return CardOutcome { recovered, notice: Some(text) };
+    };
+    let mut guard = shared.recovery();
+    let Some(recovery) = guard.as_mut() else {
+        return CardOutcome { recovered, notice };
+    };
+    match recovery.begin(&profile) {
+        Ok(errs) if errs.is_empty() || only_notes(&errs) => match recovery.confirm() {
+            Ok(()) => log(&format!("Confirmed startup profile '{name}' applied{label}.")),
+            Err(e) => {
+                let text = format!("Startup recovery interrupted{label}: {}", e.message);
+                log(&text);
+                notice = Some(text);
+            }
+        },
+        Ok(errs) => {
+            let rollback = recovery.revert();
+            let tail = if recovery.has_pending() {
+                format!(" Recovery failed: {}", rollback.join("; "))
+            } else {
+                " — restored fallback profile.".to_string()
+            };
+            let text = format!("Startup apply failed{label}: {}{tail}", errs.join("; "));
+            log(&text);
+            notice = Some(text);
+        }
+        Err(e) => {
+            let text = format!("Startup recovery interrupted{label}: {}", e.message);
+            log(&text);
+            notice = Some(text);
+        }
+    }
+    CardOutcome { recovered, notice }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    struct NoTask;
+
+    impl StartupTasks for NoTask {
+        fn exists(&self) -> bool {
+            true
+        }
+        fn register(&self, _exe: &str, _profile: &str) -> roch_core::Result<()> {
+            Ok(())
+        }
+        fn unregister(&self) -> roch_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Approve `name` for startup on card `index` of a simulated two-card machine, the way ticking
+    /// Startup does: a confirmed trial, then the approval.
+    fn approve(store: &ProfileStore, index: usize, name: &str) {
+        let service = Arc::new(TuningService::new(backends::mock_variant(Some(backends::MOCK_MULTI))));
+        service.initialize(index).unwrap();
+        let mut recovery =
+            roch_core::services::ProfileRecovery::for_selected(store.root_directory(), &service).unwrap();
+        let mut profile = roch_core::TuningProfile { power_limit_percent: 90, ..Default::default() };
+        profile.clamp_to(&service.capabilities());
+        let messages = recovery.trial(&profile);
+        assert!(messages.is_empty() || only_notes(&messages), "{messages:?}");
+        recovery.approve_startup(name).unwrap();
+    }
+
+    fn logon(store: &Arc<ProfileStore>) -> String {
+        let flags = Flags::parse(&v(&["--mock", "multi", "--apply-profile", "Slot 1", "--exit"]));
+        let started = start(&flags, store.clone(), AppSettings::default(), Arc::new(NoTask), |_| false);
+        assert!(matches!(started, Started::Exit(0)));
+        std::fs::read_to_string(store.root_directory().join("roch-gpu.log")).unwrap()
+    }
+
+    #[test]
+    fn a_logon_apply_reaches_every_card_that_approved_it() {
+        let dir = std::env::temp_dir().join(format!("roch-startup-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(ProfileStore::new(Some(dir.clone())).unwrap());
+
+        // Approved on the second card only: that card is tuned, the first is told how to join it.
+        approve(&store, 1, "Slot 1");
+        let log = logon(&store);
+        assert_eq!(log.matches("Confirmed startup profile 'Slot 1' applied on").count(), 1, "{log}");
+        assert!(log.contains("PCI bus 2, slot 0).") || log.contains("(PCI bus 2, slot 0)"), "{log}");
+        assert!(log.contains("before it can run at logon on"), "{log}");
+        assert!(log.contains("rochgpu startup --enable"), "{log}");
+
+        // Approved on both: both are tuned, and nothing is left to confirm.
+        approve(&store, 0, "Slot 1");
+        let _ = std::fs::remove_file(store.root_directory().join("roch-gpu.log"));
+        let log = logon(&store);
+        assert_eq!(log.matches("Confirmed startup profile 'Slot 1' applied on").count(), 2, "{log}");
+        assert!(!log.contains("before it can run at logon"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

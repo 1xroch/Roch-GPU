@@ -6,12 +6,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::models::TuningProfile;
+use crate::services::TuningService;
 use crate::{GpuError, Result, only_notes};
 
 /// The applier: writes a profile to the card and returns its messages (errors and notes). A
@@ -190,6 +192,51 @@ impl ProfileRecovery {
 
     pub fn startup_profile(&self, name: &str) -> Option<TuningProfile> {
         self.state.startup.get(name).map(TuningProfile::clone_profile)
+    }
+
+    /// The journal for the card `service` has selected, in `directory`. Each card has its own,
+    /// keyed by vendor, bus and name, so two cards of the same model never share one.
+    pub fn for_selected(directory: &Path, service: &Arc<TuningService>) -> Result<Self> {
+        let device = service.device();
+        let key = format!("{}|{}|{}", device.vendor, device.bus_id, device.name);
+        let stock = TuningProfile::stock(&service.capabilities(), Some(&device.name));
+        let svc = service.clone();
+        ProfileRecovery::new(directory, &key, &stock, Box::new(move |p| svc.apply(&p)))
+    }
+
+    /// Apply `candidate` as a journalled trial: persist it as pending, apply, then confirm on
+    /// success or revert on failure (C# `App.TrialProfile`). Returns the apply's messages; only
+    /// notes, or none, means the trial was confirmed.
+    pub fn trial(&mut self, candidate: &TuningProfile) -> Vec<String> {
+        // The C# try block: any failure (journal write, confirm) lands in the catch below.
+        let attempt = (|| -> Result<Vec<String>> {
+            let errors = self.begin(candidate)?;
+            if success(&errors) {
+                self.confirm()?;
+                return Ok(errors);
+            }
+            let rollback = self.revert();
+            if !success(&rollback) {
+                return Ok(vec![format!("Recovery failed; retry by reopening Roch GPU: {}", rollback.join("; "))]);
+            }
+            Ok(vec![if !success(&errors) {
+                format!("Trial failed and was reverted: {}", errors.join("; "))
+            } else {
+                "Trial reverted; startup settings were not changed.".into()
+            }])
+        })();
+        match attempt {
+            Ok(messages) => messages,
+            Err(e) => {
+                if self.has_pending() {
+                    let rollback = self.revert();
+                    if !success(&rollback) {
+                        return vec![format!("{} Recovery failed: {}", e.message, rollback.join("; "))];
+                    }
+                }
+                vec![e.message]
+            }
+        }
     }
 }
 

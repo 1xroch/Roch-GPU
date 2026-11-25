@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use roch_core::services::{AppSettings, ProfileRecovery, ProfileStore, TuningService, startup_task};
-use roch_core::{Result, TuningProfile, only_notes};
+use roch_core::{Result, TuningProfile};
 
 /// The logon task, behind a trait so tests never run schtasks.
 pub trait StartupTasks: Send + Sync {
@@ -132,11 +132,7 @@ impl Shared {
     /// Open the journal for the selected device, applying through the service. The stock profile
     /// is what a trial reverts to when nothing was ever confirmed.
     pub fn open_recovery(&self) -> Result<ProfileRecovery> {
-        let d = self.service.device();
-        let key = format!("{}|{}|{}", d.vendor, d.bus_id, d.name);
-        let stock = TuningProfile::stock(&self.service.capabilities(), Some(&d.name));
-        let svc = self.service.clone();
-        ProfileRecovery::new(self.store.root_directory(), &key, &stock, Box::new(move |p| svc.apply(&p)))
+        ProfileRecovery::for_selected(self.store.root_directory(), &self.service)
     }
 
     /// Apply a profile as a journalled trial: persist it as pending, apply, then confirm on success
@@ -148,35 +144,7 @@ impl Shared {
         };
         let mut candidate = profile.clone_profile();
         candidate.clamp_to(&self.service.capabilities());
-        // The C# try block: any failure (journal write, confirm) lands in the catch below.
-        let attempt = (|| -> Result<Vec<String>> {
-            let errors = recovery.begin(&candidate)?;
-            if errors.is_empty() || only_notes(&errors) {
-                recovery.confirm()?;
-                return Ok(errors);
-            }
-            let rollback = recovery.revert();
-            if !rollback.is_empty() && !only_notes(&rollback) {
-                return Ok(vec![format!("Recovery failed; retry by reopening Roch GPU: {}", rollback.join("; "))]);
-            }
-            Ok(vec![if !errors.is_empty() && !only_notes(&errors) {
-                format!("Trial failed and was reverted: {}", errors.join("; "))
-            } else {
-                "Trial reverted; startup settings were not changed.".into()
-            }])
-        })();
-        match attempt {
-            Ok(messages) => messages,
-            Err(e) => {
-                if recovery.has_pending() {
-                    let rollback = recovery.revert();
-                    if !rollback.is_empty() && !only_notes(&rollback) {
-                        return vec![format!("{} Recovery failed: {}", e.message, rollback.join("; "))];
-                    }
-                }
-                vec![e.message]
-            }
-        }
+        recovery.trial(&candidate)
     }
 
     /// The log file next to the profiles (C# `App.LogPath`).
