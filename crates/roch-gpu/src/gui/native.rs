@@ -336,15 +336,30 @@ fn apply_opacity(_: &str, _: f32) -> bool {
 pub struct WindowMaintenance {
     bounds: Option<(eframe::egui::Vec2, f32, Option<eframe::egui::Vec2>)>,
     alpha: Option<u8>,
+    /// Frames left in which to pull the window back on screen after a saved position was restored.
+    recheck_frames: u8,
 }
 
 impl WindowMaintenance {
+    /// Call after sending a saved position. The move lands a frame or two later, without changing
+    /// the size that `update` watches, so a position saved on a wider or second monitor would
+    /// otherwise open the window mostly off screen (Telemetry saved at x 1744 opened 624 px past
+    /// the edge of a 1920 px desktop).
+    pub fn position_restored(&mut self) {
+        self.recheck_frames = 3;
+    }
+
     pub fn update(&mut self, ctx: &eframe::egui::Context, title: &str, opacity: f32) {
         let pixels_per_point = ctx.pixels_per_point();
         let bounds =
             ctx.input(|i| i.viewport().outer_rect.map(|r| (r.size(), pixels_per_point, i.viewport().monitor_size)));
         if bounds.is_some() && bounds != self.bounds && keep_on_screen(title) {
             self.bounds = bounds;
+        }
+        if self.recheck_frames > 0 {
+            self.recheck_frames -= 1;
+            keep_on_screen(title);
+            ctx.request_repaint();
         }
         let alpha = (opacity.clamp(0.3, 1.0) * 255.0).round() as u8;
         if self.alpha != Some(alpha) && apply_opacity(title, opacity) {

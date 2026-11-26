@@ -620,6 +620,7 @@ impl RochApp {
                 && let Some(at) = native::position_points(*position, ctx.zoom_factor())
             {
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(at));
+                self.window_maintenance.position_restored();
             }
         }
         // Asking is a new process on Linux, so not every 2 s for a window nobody can see. It asks again

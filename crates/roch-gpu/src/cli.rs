@@ -1131,14 +1131,16 @@ RochGPU.exe — Roch GPU command line / undervolt CLI (needs admin for writes)
   RochGPU.exe sensors [--gpu 0]          list supplemental native sensor readings
   RochGPU.exe monitor [--gpu 0] [--interval 1000]
   RochGPU.exe apply [--gpu 0] [--core +150] [--core-min 500] [--mem +800] [--power 90] [--temp 80] [--soft-temp 83|card] [--volt 25] [--uv -100] [--nvvdd 1100] [--nvvdd-min 800] [--msvdd 1050] [--msvdd-min 800] [--nvvdd-ocp 300] [--msvdd-ocp 120] [--xbar +100] [--sys +50] [--video +50] [--clock-min 210 --clock-max 2800] [--mem-min 810 --mem-max 810] [--fan 60|auto]
-    each gated flag arms its own lever for that apply; a lever you do not name goes back to the driver's own value
+    each gated flag arms its own lever for that apply; a lever you do not name goes back to the driver's own value,
+    except a core/MSVDD rail or memory clock lock left by an earlier run, which stays until `reset`
+    on NVIDIA a voltage cap is itself a clock lock and replaces --clock-min/--clock-max while it is set
     --soft-temp: a software temperature limit below the card's own (RTX 50); 'card' leaves it to the card; only enforced while the app runs
     --core / --uv on AMD RDNA 3: the maximum core clock (MHz) and maximum voltage (mV), not offsets; see `info` for the range
     --core-min (AMD RDNA 3): the minimum core clock in MHz
   RochGPU.exe apply-profile <name> [--gpu 0]
   RochGPU.exe list-profiles
   RochGPU.exe reset [--gpu 0]
-  RochGPU.exe diag                       dump everything the driver reports (for bug reports)
+  RochGPU.exe diag [--gpu 0]             dump everything the driver reports (for bug reports)
   RochGPU.exe startup --enable <profile> [--gpu 0] | --disable | --status
                                      --enable applies the profile to every card (or the one --gpu names)
                                      as a trial and confirms it to run at logon, as ticking Startup does

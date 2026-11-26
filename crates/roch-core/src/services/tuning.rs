@@ -706,6 +706,21 @@ fn add_clamp_notes(notes: &mut Vec<String>, caps: &GpuCapabilities, asked: &Tuni
         // card holds itself. That is a choice, not a surprise, so it gets no note (the log and the
         // slider's tooltip still say so).
     }
+    // A voltage cap is itself a clock lock, and it is written after the range (see
+    // set_xoc_lever), so it replaces a range asked for in the same apply. Measured on an RTX 5060
+    // Ti: a 210..2400 MHz range under a 950 mV cap ran at 2760 MHz, with the apply reporting success.
+    if asked.xoc_armed.has(XocLever::CLOCK_RANGE)
+        && caps.can_lock_clocks
+        && caps.voltage_style == VoltageControlStyle::Absolute
+        && applied.target_voltage_mv > 0
+        && applied.target_voltage_mv < caps.stock_max_voltage_mv
+    {
+        notes.push(format!(
+            "{NOTE_PREFIX} the {} mV voltage cap holds the core clock with a lock of its own, which replaces the \
+             clock range — the range is not in effect while a cap is set.",
+            applied.target_voltage_mv
+        ));
+    }
 }
 
 /// Write the gated (XOC) levers. Armed levers take the profile's value; a lever this service

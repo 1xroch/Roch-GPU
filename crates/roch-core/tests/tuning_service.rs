@@ -397,6 +397,35 @@ fn apply_fan_curve_release_reset() {
     assert_eq!(st(&svc).core_offset_mhz, 0, "reset");
 }
 
+/// A voltage cap is a clock lock written after the range, so a range asked for beside one never
+/// holds. Seen on an RTX 5060 Ti: 210..2400 MHz under a 950 mV cap ran at 2760 MHz, reported "Applied.".
+#[test]
+fn a_clock_range_under_a_voltage_cap_says_it_is_replaced() {
+    let svc = new_svc();
+    let errs = svc.apply(&TuningProfile {
+        xoc_armed: XocLever::CLOCK_RANGE,
+        clock_lock_min_mhz: 210,
+        clock_lock_max_mhz: 2400,
+        target_voltage_mv: 950,
+        ..profile()
+    });
+    assert!(only_notes(&errs), "{errs:?}");
+    assert!(
+        errs.iter().any(|e| e.contains("950 mV voltage cap") && e.contains("replaces the clock range")),
+        "{errs:?}"
+    );
+
+    // Without a cap the range is the only lock, and nothing is said.
+    let plain = new_svc();
+    let errs = plain.apply(&TuningProfile {
+        xoc_armed: XocLever::CLOCK_RANGE,
+        clock_lock_min_mhz: 210,
+        clock_lock_max_mhz: 2400,
+        ..profile()
+    });
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
 /// "Clock range: a window the card is held inside, armed like the other levers."
 #[test]
 fn clock_range_is_a_gated_lever() {

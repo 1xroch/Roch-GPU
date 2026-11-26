@@ -177,6 +177,7 @@ impl ChildChrome {
                 && let Some(point) = super::native::position_points(*at, ctx.zoom_factor())
             {
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(point));
+                self.maintenance.position_restored();
             }
         }
         self.maintenance.update(ctx, &self.title, prefs.opacity);
